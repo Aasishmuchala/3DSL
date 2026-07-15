@@ -1,0 +1,355 @@
+"""Controller — the one object the UI talks to. Wires core (brains) to bridge (hands).
+
+Owns: the per-scene Session, the classified rig + light baselines, the stats-provider chain,
+the three LLM calls, and the director hooks. Everything scene-touching stays main-thread
+(the UI guarantees callers); LLM/stats calls are pure I/O the UI may run on workers.
+
+Stats provider chain (first that yields wins):
+  1. core.metrics in-process — Pillow if installed; for our own PNG renders the stdlib
+     reader ALWAYS works, so loop stats never fail;
+  2. sidecar: config.system_python -m maxgaffer.sidecar.metrics_cli (Pillow there);
+  3. references only: Max transcode → PNG → stdlib reader.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import subprocess
+import time
+from typing import Callable, Dict, List, Optional, Tuple
+
+from ..core import metrics, omega, prompts, rules
+from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
+from ..core.genome import LightingState
+from ..core.parse import ParseError, validate_analysis
+from ..core.session import Session, sidecar_path
+from . import apply as ap
+from . import config as cfgmod
+from . import render as rd
+from . import scene as sc
+from . import vantage as vt
+
+
+class Controller:
+    def __init__(self, cfg: Optional[cfgmod.Config] = None):
+        self.cfg = cfg or cfgmod.load()
+        self._session: Optional[Session] = None
+        self._session_scene = None
+        self._rig = None
+        self._baselines: Dict[int, float] = {}
+        self._ref_cache: Dict[str, Dict] = {}     # ref path+mtime → stats
+        self._run_dir: Optional[str] = None
+        # pure-I/O runner — the UI swaps in a worker-thread pump so gateway waits never
+        # freeze Max; pymxs is NEVER called through this (network/subprocess only)
+        self.io: Callable = lambda fn: fn()
+
+    # ------------------------------------------------------------------ scene / session
+    @property
+    def session(self) -> Session:
+        scene = sc.scene_path()
+        if self._session is None or scene != self._session_scene:
+            self._session = Session.load(sidecar_path(scene))
+            self._session_scene = scene
+        return self._session
+
+    def save_session(self) -> bool:
+        self.session.path = sidecar_path(sc.scene_path())   # scene may have been saved-as
+        return self.session.save()
+
+    def rig(self, refresh: bool = False):
+        if self._rig is None or refresh:
+            self._rig = sc.classify_rig()
+            self._baselines = ap.capture_baselines(self._rig)
+        return self._rig
+
+    def cameras(self) -> List[Dict]:
+        cams = sc.list_cameras()
+        for c in cams:
+            e = self.session.cameras.get(c["name"])
+            c["reference"] = e.reference if e else ""
+            c["score"] = e.score if e else None
+            c["has_state"] = bool(e and e.state)
+        return cams
+
+    def read_state(self, camera_name: str = "") -> LightingState:
+        cam = sc.get_camera(camera_name) if camera_name else None
+        return ap.read_state(self.rig(), self._baselines, cam)
+
+    def apply_state(self, state: LightingState, camera_name: str = "") -> List[str]:
+        cam = sc.get_camera(camera_name) if camera_name else None
+        return ap.apply_state(self.rig(), self._baselines, state, cam)
+
+    def select_camera(self, camera_name: str, apply_saved: bool = True) -> List[str]:
+        sc.set_active_camera(camera_name)
+        warnings: List[str] = []
+        if apply_saved and self.session.settings.get("apply_on_select", True):
+            e = self.session.cameras.get(camera_name)
+            if e and e.state is not None:
+                warnings = self.apply_state(e.state, camera_name)
+        return warnings
+
+    # ------------------------------------------------------------------ stats providers
+    def stats_for(self, path: str) -> Optional[Dict]:
+        s = metrics.compute_stats(path)
+        if s is not None:
+            return s
+        return self._sidecar_stats(path)
+
+    def _sidecar_stats(self, path: str) -> Optional[Dict]:
+        py = self.cfg.system_python
+        if not py or not os.path.exists(py):
+            return None
+        try:
+            repo = self.cfg.repo_path or os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            proc = subprocess.run(
+                [py, "-m", "maxgaffer.sidecar.metrics_cli", path],
+                capture_output=True, text=True, timeout=60, cwd=repo)
+            data = json.loads(proc.stdout or "null")
+            if isinstance(data, list) and data and isinstance(data[0].get("stats"), dict):
+                return data[0]["stats"]
+        except Exception:
+            pass
+        return None
+
+    def ref_stats(self, ref_path: str) -> Optional[Dict]:
+        try:
+            key = f"{ref_path}:{os.path.getmtime(ref_path)}"
+        except OSError:
+            return None
+        if key in self._ref_cache:
+            return self._ref_cache[key]
+        s = self.stats_for(ref_path)
+        if s is None:  # last resort: Max transcodes anything it can read to a small PNG
+            png = os.path.join(self._ensure_run_dir("refs"), "ref_transcode.png")
+            if rd.transcode_to_png(ref_path, png):
+                s = metrics.compute_stats(png)
+        if s is not None:
+            self._ref_cache[key] = s
+        return s
+
+    # ------------------------------------------------------------------ LLM plumbing
+    def _image_block(self, path: str) -> Optional[dict]:
+        """Payload-slim image block: Pillow in-process → sidecar --b64 → raw file (small
+        renders) → Max transcode to PNG."""
+        try:
+            from PIL import Image  # type: ignore
+            import io
+
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                im.thumbnail((768, 768))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=85)
+            return omega.image_block(
+                base64.b64encode(buf.getvalue()).decode("ascii"), "image/jpeg")
+        except Exception:
+            pass
+        py = self.cfg.system_python
+        if py and os.path.exists(py):
+            try:
+                repo = self.cfg.repo_path or os.path.dirname(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                proc = subprocess.run(
+                    [py, "-m", "maxgaffer.sidecar.metrics_cli", path, "--b64"],
+                    capture_output=True, text=True, timeout=60, cwd=repo)
+                data = json.loads(proc.stdout or "null")
+                if isinstance(data, list) and data and data[0].get("b64"):
+                    return omega.image_block(data[0]["b64"],
+                                             data[0].get("media_type", "image/jpeg"))
+            except Exception:
+                pass
+        try:
+            if os.path.getsize(path) <= 3_500_000:
+                block = omega.image_block_from_file(path)
+                if block is not None:
+                    return block
+        except OSError:
+            return None
+        png = os.path.join(self._ensure_run_dir("refs"),
+                           "llm_" + os.path.basename(path) + ".png")
+        if rd.transcode_to_png(path, png, max_dim=768):
+            return omega.image_block_from_file(png)
+        return None
+
+    def analyze_reference(self, camera_name: str) -> Dict:
+        """ANALYZE call (cached in the session until the reference changes)."""
+        e = self.session.entry(camera_name)
+        if not e.reference:
+            raise RuntimeError("no reference image bound to this camera")
+        if e.semantics:
+            return e.semantics
+        block = self._image_block(e.reference)
+        if block is None:
+            raise RuntimeError(f"could not read reference image: {e.reference}")
+        reply = self.io(lambda: omega.call(
+            self.cfg.api_key, prompts.ANALYZE_SYSTEM,
+            [{"role": "user", "content": [block, omega.text_block(prompts.analyze_user_text())]}],
+            model=self.cfg.model, max_tokens=2048))
+        semantics = validate_analysis(reply)
+        e.semantics = semantics
+        self.save_session()
+        return semantics
+
+    def _llm_deltas_hook(self, ref_block: dict) -> Callable[[Dict], str]:
+        def call_llm(ctx: Dict) -> str:
+            render_block = self._image_block(ctx["render_path"])
+            content = [ref_block]
+            if render_block is not None:
+                content.append(render_block)
+            content.append(omega.text_block(prompts.deltas_user_text(
+                ctx["state_table"], ctx["semantics"], ctx["score_history"],
+                ctx["analytic_applied"], ctx["iteration"], ctx["max_iterations"],
+                ctx.get("rig_notes", ""))))
+            return self.io(lambda: omega.call(
+                self.cfg.api_key, prompts.DELTAS_SYSTEM,
+                [{"role": "user", "content": content}],
+                model=self.cfg.model, max_tokens=2048))
+        return call_llm
+
+    # ------------------------------------------------------------------ the headline act
+    def run_match(
+        self,
+        camera_name: str,
+        log: Callable[[str], None],
+        should_cancel: Callable[[], bool] = lambda: False,
+        locks: Optional[set] = None,
+        do_sweep: bool = False,
+    ) -> MatchResult:
+        e = self.session.entry(camera_name)
+        if not e.reference:
+            raise RuntimeError("bind a reference image to this camera first")
+        rig = self.rig(refresh=True)
+        cam = sc.get_camera(camera_name)
+        if cam is None:
+            raise RuntimeError(f"camera '{camera_name}' not found in the scene")
+        sc.set_active_camera(camera_name)
+        locks = set(locks if locks is not None else e.locks)
+        run_dir = self._new_run_dir(camera_name)
+        log(f"run dir: {run_dir}")
+
+        log("analyzing reference…")
+        semantics = self.analyze_reference(camera_name)
+        log(f"reference: {semantics['time_of_day']}, {semantics['sky']} sky, "
+            f"sun {semantics['sun_altitude_band']} @ bearing "
+            f"{semantics['sun_bearing_deg']:+.0f}°, wb ~{semantics['wb_kelvin_estimate']:.0f}K"
+            f" — {semantics['key_notes']}")
+
+        ref_stats = self.ref_stats(e.reference)
+        if ref_stats is None:
+            log("⚠ reference stats unavailable (install Pillow or set system_python) — "
+                "running LLM-visual mode")
+        ref_block = self._image_block(e.reference)
+        if ref_block is None:
+            raise RuntimeError("reference image could not be prepared for the LLM")
+
+        current = ap.read_state(rig, self._baselines, cam)
+        start, why = rules.initial_state(semantics, current,
+                                         sc.camera_yaw_deg(cam), locks)
+        for line in why:
+            log("first guess: " + line)
+
+        hooks = Hooks(
+            apply=lambda st: self._apply_logged(rig, st, cam, log),
+            render=lambda tag: rd.render_frame(
+                cam, os.path.join(run_dir, f"{tag}.png"),
+                self.cfg.loop_width, self.cfg.loop_height),
+            stats=self.stats_for,
+            llm_deltas=self._llm_deltas_hook(ref_block),
+            log=log,
+            should_cancel=should_cancel,
+        )
+
+        if do_sweep and rig.get("sun") is not None and "sun.azimuth_deg" not in locks:
+            log(f"sun sweep: {self.cfg.sweep_count} directions…")
+            az, _why = run_sun_sweep(
+                start, rules.sweep_azimuths(self.cfg.sweep_count), hooks,
+                llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs))
+            if az is not None:
+                start.set("sun.azimuth_deg", az)
+
+        cfg = MatchConfig(
+            max_iterations=int(self.cfg.max_iterations),
+            target_score=float(self.cfg.target_score),
+            analytic=ref_stats is not None,
+            weights=self.cfg.critic_weights or None,
+        )
+        result = run_match(start, ref_stats, semantics, hooks, cfg, locks,
+                           rig_notes="; ".join(rig.get("notes", [])))
+        e.locks = locks
+        self.session.record_match(camera_name, result.best_state, result.best_score)
+        self.save_session()
+        score_txt = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
+        log(f"match finished: {result.stop_reason}, best score {score_txt} "
+            f"({len(result.iterations)} iterations)")
+        return result
+
+    def _sweep_call(self, ref_block: dict, paths: List[str], azimuths: List[float]) -> str:
+        content: List[dict] = [ref_block]
+        for p in paths:
+            block = self._image_block(p)
+            if block is not None:
+                content.append(block)
+        content.append(omega.text_block(prompts.sweep_user_text(azimuths)))
+        return self.io(lambda: omega.call(
+            self.cfg.api_key, prompts.SWEEP_SYSTEM,
+            [{"role": "user", "content": content}],
+            model=self.cfg.model, max_tokens=1024))
+
+    def _apply_logged(self, rig, state: LightingState, cam, log) -> None:
+        for w in ap.apply_state(rig, self._baselines, state, cam):
+            log("⚠ " + w)
+
+    # ------------------------------------------------------------------ vantage
+    def start_live_link(self) -> Tuple[bool, str]:
+        return vt.start_live_link()
+
+    def vantage_render_cameras(
+        self,
+        camera_names: List[str],
+        out_dir: str,
+        on_progress: Callable[[str, str], None],
+        use_saved_states: bool = True,
+    ) -> Dict[str, str]:
+        """Per camera: apply its saved lighting state → export .vrscene → vantage_console.
+        The shot-board button: every camera renders under its own matched light."""
+        jobs: List[Dict] = []
+        export_dir = os.path.join(self._ensure_run_dir("vantage"), _stamp())
+        for name in camera_names:
+            on_progress(name, "applying + exporting")
+            if use_saved_states:
+                e = self.session.cameras.get(name)
+                if e and e.state is not None:
+                    self.apply_state(e.state, name)
+            scene_file = vt.export_vrscene(
+                os.path.join(export_dir, f"{_safe(name)}.vrscene"), name)
+            if scene_file is None:
+                on_progress(name, "export failed")
+                return {name: "export failed (vrayExportVRScene missing or camera not set)"}
+            jobs.append({"camera": name, "scene_file": scene_file,
+                         "output": os.path.join(out_dir, f"{_safe(name)}.png")})
+        return vt.render_stills(jobs, self.cfg.vantage_console,
+                                self.cfg.final_width, self.cfg.final_height, on_progress)
+
+    # ------------------------------------------------------------------ dirs
+    def _ensure_run_dir(self, sub: str) -> str:
+        stem = _safe(os.path.splitext(os.path.basename(sc.scene_path() or "unsaved"))[0])
+        d = os.path.join(cfgmod.sessions_dir(), stem, sub)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _new_run_dir(self, camera_name: str) -> str:
+        d = os.path.join(self._ensure_run_dir(_safe(camera_name)), _stamp())
+        os.makedirs(d, exist_ok=True)
+        self._run_dir = d
+        return d
+
+
+def _safe(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name) or "unnamed"
+
+
+def _stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")

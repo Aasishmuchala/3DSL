@@ -1,0 +1,178 @@
+"""Omega gateway client — MaxGaffer's single LLM network surface.
+
+Ported contract-verbatim from MaxDirector (itself ported from LightMatch), because the wire
+contract is hard-won and verified live against the real gateway:
+  - NO tools / tool_choice (the gateway 500s on them) — the JSON schema is embedded in the
+    system prompt and the reply is parsed out of the TEXT blocks;
+  - non-streaming; Bearer key; anthropic-version header;
+  - retries with backoff on 429/5xx; ~120s wall-clock ceiling per attempt;
+  - multimodal via base64 image blocks (reference + render comparisons are the whole point).
+
+The only module in core allowed to touch the network; ``post`` is injectable so the entire
+suite runs offline.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Any, Optional
+
+GATEWAY_URL = "https://omega.kesarcloud.in/v1/messages"
+TIMEOUT_S = 120
+BACKOFF_S = (2.0, 6.0, 15.0)
+DEFAULT_MODEL = "claude-opus-4-8"
+
+
+class OmegaError(RuntimeError):
+    def __init__(self, message: str, kind: str = "other", raw: str = ""):
+        super().__init__(message)
+        self.kind = kind
+        self.raw = raw
+
+
+def extract_text(payload: dict) -> str:
+    blocks = payload.get("content") or []
+    return "\n".join(
+        b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"
+    ).strip()
+
+
+def parse_json_from_text(text: str) -> Optional[dict]:
+    """First balanced top-level {...} object in the reply — thinking spill or stray prose
+    around the JSON must not break parsing."""
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                        if isinstance(obj, dict):
+                            return obj
+                    except json.JSONDecodeError:
+                        break
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
+def _default_post(url: str, headers: dict, body: bytes, timeout: int) -> tuple:
+    """Stdlib HTTP POST, imported lazily so tests never touch the network by accident."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 fixed https base
+            return resp.getcode(), resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:  # 4xx/5xx still carry a body we want to inspect
+        return e.code, e.read().decode("utf-8", errors="replace")
+
+
+def call(
+    key: str,
+    system: str,
+    messages: list,
+    model: str = DEFAULT_MODEL,
+    max_tokens: int = 8192,
+    post=_default_post,
+) -> str:
+    """One resilient gateway round; returns the reply TEXT. Raises OmegaError with a typed
+    kind (auth | network | other) on failure. ``post`` is injectable for tests."""
+    if not key:
+        raise OmegaError("No API key set — paste your oc_ key in MaxGaffer's settings.", "auth")
+    body = json.dumps(
+        {
+            "model": model,
+            "max_tokens": max_tokens,
+            "stream": False,
+            "system": system,
+            "messages": messages,
+        }
+    ).encode("utf-8")
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {key}",
+        "anthropic-version": "2023-06-01",
+    }
+    last = "gateway request failed"
+    for attempt in range(len(BACKOFF_S) + 1):
+        status = None
+        text_body = ""
+        try:
+            status, text_body = post(GATEWAY_URL, headers, body, TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001 network layer surfaces as a retryable miss
+            last = f"network error: {e}"
+        if status is not None:
+            if status == 401:
+                raise OmegaError("Gateway returned 401 — the API key is missing or invalid.", "auth")
+            if 200 <= status < 300:
+                try:
+                    payload = json.loads(text_body)
+                except ValueError:
+                    payload = {}
+                text = extract_text(payload)
+                if text:
+                    return text
+                last = "the model returned no text"
+            elif status == 429 or 500 <= status <= 599:
+                last = f"gateway HTTP {status}"
+            else:
+                raise OmegaError(
+                    f"Gateway request failed: HTTP {status} — {text_body[:200]}",
+                    "other",
+                    text_body[:2000],
+                )
+        if attempt < len(BACKOFF_S):
+            time.sleep(BACKOFF_S[attempt])
+    raise OmegaError(last, "network")
+
+
+def text_block(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def image_block(b64: str, media_type: str = "image/png") -> dict:
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
+
+
+def image_block_from_file(path: str) -> Optional[dict]:
+    """Base64 image block straight from disk (media type from the extension)."""
+    import base64
+    import os
+
+    ext = os.path.splitext(path)[1].lower()
+    media = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+             "webp": "image/webp"}.get(ext.lstrip("."), None)
+    if media is None:
+        return None
+    try:
+        with open(path, "rb") as f:
+            return image_block(base64.b64encode(f.read()).decode("ascii"), media)
+    except OSError:
+        return None
+
+
+def ping(key: str, model: str = DEFAULT_MODEL, post=_default_post) -> str:
+    text = call(
+        key, "Reply with exactly the two characters: OK",
+        [{"role": "user", "content": "ping"}], model=model, max_tokens=16, post=post,
+    )
+    return f"gateway reachable ({model}): {text.strip()[:24]!r}"

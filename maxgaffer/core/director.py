@@ -1,0 +1,257 @@
+"""The match loop — a sans-IO state machine. Hooks do the touching; this does the thinking.
+
+Iteration shape (one render per iteration — renders are the expensive resource):
+    apply(state) → render → stats → score → [converged? stop]
+    → analytic solve (EV/WB, deterministic) + LLM deltas (geometry/mood, bounded)
+    → merge into next state → repeat
+
+Reliability guards, in the MaxDirector tradition:
+  * keep-best — the best-scoring state is tracked and ALWAYS re-applied at the end, so an
+    exploratory move that made things worse can never be the final answer;
+  * revert-on-slump — two consecutive scores meaningfully below best snap the loop back to
+    the best state before asking the LLM again (one exploratory move is allowed, a slide
+    is not);
+  * every LLM proposal passes genome validation (unknown → dropped, locked → refused,
+    bounds → clamped, per-iteration step → limited);
+  * metrics missing (no stats engine / no scores) degrades to LLM-visual-only mode with the
+    analytic solver off — the loop still runs, the log says so loudly.
+
+All hooks are injected, so the whole loop is unit-tested off-Max with fakes.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+from . import critic, solver
+from .genome import LightingState, apply_changes, state_table
+from .parse import ParseError
+
+
+@dataclass
+class MatchConfig:
+    max_iterations: int = 5
+    target_score: float = 82.0
+    stall_delta: float = 1.5      # min improvement over best to count as progress
+    stall_patience: int = 2       # iterations without progress before stopping
+    slump_tolerance: float = 3.0  # how far below best counts as a slump
+    analytic: bool = True         # run the EV/WB histogram solver each iteration
+    max_changes: int = 4
+    weights: Optional[Dict[str, float]] = None
+
+
+@dataclass
+class Hooks:
+    """The loop's only contact with the world. ``apply``/``render`` run on Max's main thread
+    (the UI layer guarantees that); llm/stats may be slow and are wrapped by the caller."""
+    apply: Callable[[LightingState], None]
+    render: Callable[[str], Optional[str]]            # tag → image path (None = failed)
+    stats: Callable[[str], Optional[Dict]]            # image path → stats dict
+    llm_deltas: Callable[[Dict], str]                 # context → raw reply text
+    log: Callable[[str], None] = lambda msg: None
+    should_cancel: Callable[[], bool] = lambda: False
+
+
+@dataclass
+class IterationRecord:
+    index: int
+    state: Dict
+    render_path: Optional[str] = None
+    score: Optional[float] = None
+    components: Dict[str, float] = field(default_factory=dict)
+    analytic_changes: Dict[str, float] = field(default_factory=dict)
+    llm_accepted: Dict[str, float] = field(default_factory=dict)
+    llm_rejected: List[str] = field(default_factory=list)
+    assessment: str = ""
+    reverted_to_best: bool = False
+
+
+@dataclass
+class MatchResult:
+    best_state: LightingState
+    best_score: Optional[float]
+    best_render: Optional[str]
+    stop_reason: str
+    iterations: List[IterationRecord] = field(default_factory=list)
+
+
+def run_match(
+    start_state: LightingState,
+    ref_stats: Optional[Dict],
+    semantics: Dict,
+    hooks: Hooks,
+    cfg: Optional[MatchConfig] = None,
+    locks: Optional[Set[str]] = None,
+    rig_notes: str = "",
+) -> MatchResult:
+    cfg = cfg or MatchConfig()
+    locks = locks or set()
+    metrics_ok = ref_stats is not None
+    if not metrics_ok:
+        hooks.log("⚠ metrics unavailable — LLM-visual mode (no analytic solve, no scores)")
+
+    state = start_state.copy()
+    best_state = state.copy()
+    best_score: Optional[float] = None
+    best_render: Optional[str] = None
+    records: List[IterationRecord] = []
+    score_history: List[Tuple[int, float]] = []
+    slump_count = 0
+    stall_count = 0
+    stop_reason = "max_iterations"
+
+    for i in range(cfg.max_iterations):
+        if hooks.should_cancel():
+            stop_reason = "cancelled"
+            break
+        rec = IterationRecord(index=i, state=state.to_dict())
+        hooks.apply(state)
+        path = hooks.render(f"iter{i:02d}")
+        rec.render_path = path
+        if path is None:
+            hooks.log(f"iter {i}: render failed — stopping")
+            stop_reason = "render_failed"
+            records.append(rec)
+            break
+
+        cur_stats = hooks.stats(path) if metrics_ok else None
+        if cur_stats is not None and ref_stats is not None:
+            verdict = critic.score(ref_stats, cur_stats, cfg.weights)
+            rec.score, rec.components = verdict.score, verdict.components
+            score_history.append((i, verdict.score))
+            hooks.log(f"iter {i}: score {verdict.summary()}")
+
+            improved = best_score is None or verdict.score > best_score + 1e-9
+            if improved:
+                if best_score is not None and verdict.score < best_score + cfg.stall_delta:
+                    stall_count += 1
+                else:
+                    stall_count = 0
+                best_score, best_state, best_render = verdict.score, state.copy(), path
+                slump_count = 0
+            else:
+                stall_count += 1
+                if verdict.score < (best_score or 0) - cfg.slump_tolerance:
+                    slump_count += 1
+                    if slump_count >= 2:
+                        hooks.log(f"iter {i}: slumping — reverting to best "
+                                  f"({best_score:.1f})")
+                        state = best_state.copy()
+                        rec.reverted_to_best = True
+                        slump_count = 0
+                else:
+                    slump_count = 0
+
+            if verdict.score >= cfg.target_score:
+                stop_reason = "target_reached"
+                records.append(rec)
+                break
+            if stall_count >= cfg.stall_patience and i >= 1:
+                stop_reason = "stalled"
+                records.append(rec)
+                break
+        else:
+            if best_render is None:
+                best_state, best_render = state.copy(), path
+
+        if i == cfg.max_iterations - 1:  # last render measured; no point proposing more
+            records.append(rec)
+            break
+
+        # ---- analytic solve (deterministic, before/independent of the LLM)
+        analytic: Dict[str, float] = {}
+        if cfg.analytic and cur_stats is not None and ref_stats is not None:
+            analytic = solver.analytic_pass(state, ref_stats, cur_stats, locks)
+            if analytic:
+                state, accepted, _ = apply_changes(state, analytic, locks, limit=False)
+                rec.analytic_changes = accepted
+                hooks.log("iter %d: analytic %s" % (
+                    i, ", ".join(f"{k}={v:.2f}" for k, v in accepted.items())))
+
+        # ---- LLM deltas
+        if hooks.should_cancel():
+            stop_reason = "cancelled"
+            records.append(rec)
+            break
+        ctx = {
+            "iteration": i,
+            "max_iterations": cfg.max_iterations,
+            "state_table": state_table(state, locks),
+            "semantics": semantics,
+            "score_history": score_history,
+            "analytic_applied": rec.analytic_changes,
+            "render_path": path,
+            "rig_notes": rig_notes,
+            "max_changes": cfg.max_changes,
+        }
+        try:
+            from .parse import validate_deltas
+
+            proposal = validate_deltas(hooks.llm_deltas(ctx), cfg.max_changes)
+        except ParseError as e:
+            hooks.log(f"iter {i}: LLM reply unusable ({e}) — keeping analytic-only step")
+            proposal = {"assessment": "", "changes": {}, "reasons": {}, "stop": False}
+        rec.assessment = proposal["assessment"]
+        if proposal["assessment"]:
+            hooks.log(f"iter {i}: gaffer: {proposal['assessment']}")
+        state, accepted, rejected = apply_changes(state, proposal["changes"], locks, limit=True)
+        rec.llm_accepted, rec.llm_rejected = accepted, rejected
+        for r in rejected:
+            hooks.log(f"iter {i}: rejected {r}")
+        for k, v in accepted.items():
+            hooks.log(f"iter {i}: Δ {k} → {v:.2f}  ({proposal['reasons'].get(k, '')})")
+        records.append(rec)
+        if proposal["stop"] and not accepted and not rec.analytic_changes:
+            stop_reason = "llm_satisfied"
+            break
+
+    # ---- always land on the best known state
+    if best_score is not None:
+        hooks.apply(best_state)
+    else:
+        best_state = state
+        hooks.apply(best_state)
+    return MatchResult(
+        best_state=best_state,
+        best_score=best_score,
+        best_render=best_render,
+        stop_reason=stop_reason,
+        iterations=records,
+    )
+
+
+def run_sun_sweep(
+    state: LightingState,
+    azimuths: List[float],
+    hooks: Hooks,
+    llm_pick: Callable[[List[str], List[float]], str],
+    n_validate=None,
+) -> Tuple[Optional[float], str]:
+    """Grid-solve the sun direction: render one low-res frame per azimuth, let the LLM do
+    multiple-choice (estimation is hard, comparison is easy). Returns (azimuth | None, why)."""
+    from .parse import validate_sweep
+
+    paths: List[str] = []
+    kept: List[float] = []
+    for az in azimuths:
+        if hooks.should_cancel():
+            return None, "cancelled"
+        probe = state.copy()
+        probe.set("sun.azimuth_deg", az)
+        hooks.apply(probe)
+        path = hooks.render(f"sweep{az:03.0f}")
+        if path:
+            paths.append(path)
+            kept.append(az)
+        else:
+            hooks.log(f"sweep: render failed at azimuth {az:.0f}° — skipping")
+    if len(paths) < 2:
+        return None, "not enough sweep renders"
+    try:
+        picked = validate_sweep(llm_pick(paths, kept), len(paths))
+    except ParseError as e:
+        return None, f"sweep reply unusable: {e}"
+    az = kept[picked["best_index"]]
+    hooks.log(f"sweep: azimuth {az:.0f}° — {picked['why']}")
+    return az, picked["why"]

@@ -1,0 +1,587 @@
+"""MaxGaffer dock — PySide6, instrument-grade dark (the LightMatch/MaxDirector house style).
+
+Layout: camera board on the left (pick a shot, see its reference + score), work column on
+the right (reference, match loop, rig sliders, Vantage). Threading contract:
+  * every pymxs touch happens on Max's MAIN thread — always;
+  * slow pure-I/O (gateway calls, sidecar stats) runs on a QThread while the main thread
+    spins a local QEventLoop, so Max stays responsive mid-match and Cancel always works;
+  * renders block Max by nature — the log narrates so it never feels dead.
+
+Loaded inside 3ds Max only (bootstrap checks deps first).
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Dict, List, Optional
+
+from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
+
+from ..core.genome import GROUP_PREFIX, LightingState, spec_for
+from ..core.omega import OmegaError, ping
+from ..maxbridge import config as cfgmod
+from ..maxbridge.controller import Controller
+
+ACCENT = "#c6bfff"
+BG = "#0e0e12"
+PANEL = "#16161c"
+ERR = "#ff6b6b"
+OK = "#7ddba3"
+
+STYLE = (
+    f"QWidget{{background:{BG};color:#e8e8ef;font-family:Inter,'Segoe UI';font-size:12px;}}"
+    f"QPushButton{{background:{PANEL};border:1px solid #2a2a33;padding:6px 10px;border-radius:6px;}}"
+    f"QPushButton:hover{{border-color:{ACCENT};}}"
+    f"QPushButton:disabled{{color:#5a5a66;border-color:#20202a;}}"
+    f"QPushButton#primary{{background:{ACCENT};color:#12121a;font-weight:600;}}"
+    f"QPushButton#danger{{border-color:{ERR};color:{ERR};}}"
+    f"QLineEdit,QComboBox,QPlainTextEdit,QTreeWidget,QListWidget,QSpinBox,QDoubleSpinBox"
+    f"{{background:{PANEL};border:1px solid #2a2a33;border-radius:6px;padding:4px;}}"
+    f"QGroupBox{{border:1px solid #24242e;border-radius:8px;margin-top:12px;padding-top:14px;"
+    f"font-weight:600;letter-spacing:1px;}}"
+    f"QGroupBox::title{{color:{ACCENT};subcontrol-origin:margin;left:10px;}}"
+    f"QSlider::groove:horizontal{{height:4px;background:#24242e;border-radius:2px;}}"
+    f"QSlider::handle:horizontal{{width:12px;background:{ACCENT};margin:-5px 0;border-radius:6px;}}"
+    f"QLabel#dim{{color:#9a9aa8;}}"
+)
+
+
+class _Worker(QtCore.QThread):
+    done = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self._fn())
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
+class MaxGafferDock(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MaxGaffer")
+        self.setStyleSheet(STYLE)
+        self.cfg = cfgmod.load()
+        self.ctrl = Controller(self.cfg)
+        self.ctrl.io = self._run_blocking_io   # gateway waits run off-thread, Max stays alive
+        self._workers: List[_Worker] = []
+        self._cancel = False
+        self._busy = False
+        self._sliders: Dict[str, QtWidgets.QDoubleSpinBox] = {}
+        self._build()
+        self.refresh_cameras()
+
+    # ================================================================= layout
+    def _build(self):
+        root = QtWidgets.QHBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+
+        # ---------------- left: camera board
+        left = QtWidgets.QVBoxLayout()
+        title = QtWidgets.QLabel("MAXGAFFER")
+        title.setStyleSheet(f"color:{ACCENT};font-weight:700;letter-spacing:4px;font-size:14px;")
+        left.addWidget(title)
+        sub = QtWidgets.QLabel("reference-matched lighting · V-Ray 7 · Vantage")
+        sub.setObjectName("dim")
+        left.addWidget(sub)
+
+        self.cam_tree = QtWidgets.QTreeWidget()
+        self.cam_tree.setHeaderLabels(["camera", "ref", "score"])
+        self.cam_tree.setRootIsDecorated(False)
+        self.cam_tree.setColumnWidth(0, 170)
+        self.cam_tree.setColumnWidth(1, 36)
+        self.cam_tree.currentItemChanged.connect(self._on_camera_selected)
+        left.addWidget(self.cam_tree, 1)
+
+        row = QtWidgets.QHBoxLayout()
+        btn_refresh = QtWidgets.QPushButton("Refresh")
+        btn_refresh.clicked.connect(self.refresh_cameras)
+        row.addWidget(btn_refresh)
+        self.chk_apply_on_select = QtWidgets.QCheckBox("apply saved light on select")
+        self.chk_apply_on_select.setChecked(True)
+        self.chk_apply_on_select.toggled.connect(self._on_apply_on_select)
+        row.addWidget(self.chk_apply_on_select)
+        left.addLayout(row)
+
+        btn_settings = QtWidgets.QPushButton("Settings…")
+        btn_settings.clicked.connect(self._open_settings)
+        left.addWidget(btn_settings)
+        root.addLayout(left, 0)
+
+        # ---------------- right: work column (scrollable)
+        right_host = QtWidgets.QScrollArea()
+        right_host.setWidgetResizable(True)
+        right_host.setFrameShape(QtWidgets.QFrame.NoFrame)
+        right_w = QtWidgets.QWidget()
+        right = QtWidgets.QVBoxLayout(right_w)
+        right_host.setWidget(right_w)
+        root.addWidget(right_host, 1)
+
+        # reference group
+        g_ref = QtWidgets.QGroupBox("REFERENCE")
+        lr = QtWidgets.QHBoxLayout(g_ref)
+        self.ref_thumb = QtWidgets.QLabel("no reference")
+        self.ref_thumb.setFixedSize(200, 112)
+        self.ref_thumb.setAlignment(QtCore.Qt.AlignCenter)
+        self.ref_thumb.setStyleSheet(f"background:{PANEL};border:1px dashed #2a2a33;"
+                                     "border-radius:6px;color:#5a5a66;")
+        lr.addWidget(self.ref_thumb)
+        ref_col = QtWidgets.QVBoxLayout()
+        btn_ref = QtWidgets.QPushButton("Load reference…")
+        btn_ref.clicked.connect(self._pick_reference)
+        ref_col.addWidget(btn_ref)
+        self.lbl_ref_info = QtWidgets.QLabel("")
+        self.lbl_ref_info.setObjectName("dim")
+        self.lbl_ref_info.setWordWrap(True)
+        ref_col.addWidget(self.lbl_ref_info, 1)
+        lr.addLayout(ref_col, 1)
+        right.addWidget(g_ref)
+
+        # match group
+        g_match = QtWidgets.QGroupBox("MATCH")
+        lm = QtWidgets.QVBoxLayout(g_match)
+        opts = QtWidgets.QHBoxLayout()
+        self.chk_sweep = QtWidgets.QCheckBox("sun sweep first")
+        self.chk_sweep.setToolTip("Grid-render 8 sun directions and let the model pick "
+                                  "before iterating — the robust solve for sun azimuth.")
+        opts.addWidget(self.chk_sweep)
+        opts.addWidget(QtWidgets.QLabel("iterations"))
+        self.spin_iters = QtWidgets.QSpinBox()
+        self.spin_iters.setRange(1, 12)
+        self.spin_iters.setValue(int(self.cfg.max_iterations))
+        opts.addWidget(self.spin_iters)
+        opts.addWidget(QtWidgets.QLabel("target"))
+        self.spin_target = QtWidgets.QDoubleSpinBox()
+        self.spin_target.setRange(50.0, 100.0)
+        self.spin_target.setValue(float(self.cfg.target_score))
+        opts.addWidget(self.spin_target)
+        opts.addStretch(1)
+        lm.addLayout(opts)
+
+        self.lock_list = QtWidgets.QListWidget()
+        self.lock_list.setMaximumHeight(96)
+        self.lock_list.setToolTip("Checked = locked. Locked parameters are never touched — "
+                                  "not by the solver, not by the model.")
+        lm.addWidget(self.lock_list)
+
+        mrow = QtWidgets.QHBoxLayout()
+        self.btn_match = QtWidgets.QPushButton("MATCH LIGHTING")
+        self.btn_match.setObjectName("primary")
+        self.btn_match.clicked.connect(self._start_match)
+        mrow.addWidget(self.btn_match, 1)
+        self.btn_cancel = QtWidgets.QPushButton("Cancel")
+        self.btn_cancel.setObjectName("danger")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self._cancel_match)
+        mrow.addWidget(self.btn_cancel)
+        lm.addLayout(mrow)
+
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(150)
+        lm.addWidget(self.log)
+        lrow = QtWidgets.QHBoxLayout()
+        btn_open_run = QtWidgets.QPushButton("Open run folder")
+        btn_open_run.clicked.connect(self._open_run_dir)
+        lrow.addWidget(btn_open_run)
+        lrow.addStretch(1)
+        lm.addLayout(lrow)
+        right.addWidget(g_match)
+
+        # rig group (sliders built dynamically from the scene)
+        g_rig = QtWidgets.QGroupBox("RIG — live controls")
+        self.rig_form = QtWidgets.QFormLayout(g_rig)
+        rig_btns = QtWidgets.QHBoxLayout()
+        btn_read = QtWidgets.QPushButton("Read scene")
+        btn_read.clicked.connect(self.rebuild_rig_controls)
+        rig_btns.addWidget(btn_read)
+        self.chk_live = QtWidgets.QCheckBox("live apply (Vantage mirrors)")
+        self.chk_live.setChecked(True)
+        rig_btns.addWidget(self.chk_live)
+        self.rig_form.addRow(rig_btns)
+        right.addWidget(g_rig)
+
+        # vantage group
+        g_v = QtWidgets.QGroupBox("VANTAGE")
+        lv = QtWidgets.QVBoxLayout(g_v)
+        vrow = QtWidgets.QHBoxLayout()
+        btn_link = QtWidgets.QPushButton("Start live link")
+        btn_link.clicked.connect(self._start_live_link)
+        vrow.addWidget(btn_link)
+        self.lbl_link = QtWidgets.QLabel("link: unknown")
+        self.lbl_link.setObjectName("dim")
+        vrow.addWidget(self.lbl_link, 1)
+        lv.addLayout(vrow)
+        vrow2 = QtWidgets.QHBoxLayout()
+        btn_render_sel = QtWidgets.QPushButton("Final render (selected)")
+        btn_render_sel.clicked.connect(lambda: self._vantage_render(selected_only=True))
+        vrow2.addWidget(btn_render_sel)
+        btn_render_all = QtWidgets.QPushButton("Render ALL matched cameras")
+        btn_render_all.clicked.connect(lambda: self._vantage_render(selected_only=False))
+        vrow2.addWidget(btn_render_all)
+        lv.addLayout(vrow2)
+        right.addWidget(g_v)
+        right.addStretch(1)
+
+    # ================================================================= helpers
+    def _log(self, msg: str):
+        self.log.appendPlainText(msg)
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+        QtWidgets.QApplication.processEvents()
+
+    def _run_blocking_io(self, fn):
+        """Run pure-I/O ``fn`` on a worker while the MAIN thread spins a local event loop —
+        Max stays alive, pymxs is never touched off-thread, exceptions re-raise here."""
+        loop = QtCore.QEventLoop()
+        box = {}
+        w = _Worker(fn)
+        self._workers.append(w)
+        w.done.connect(lambda r: (box.__setitem__("r", r), loop.quit()))
+        w.failed.connect(lambda e: (box.__setitem__("e", e), loop.quit()))
+        w.start()
+        loop.exec()
+        w.wait()
+        self._workers.remove(w)
+        if "e" in box:
+            raise RuntimeError(box["e"])
+        return box.get("r")
+
+    def _current_camera(self) -> str:
+        item = self.cam_tree.currentItem()
+        return item.text(0) if item else ""
+
+    # ================================================================= cameras
+    def refresh_cameras(self):
+        current = self._current_camera()
+        self.cam_tree.blockSignals(True)
+        self.cam_tree.clear()
+        try:
+            cams = self.ctrl.cameras()
+        except Exception as e:  # noqa: BLE001
+            self._log(f"camera scan failed: {e}")
+            cams = []
+        for c in cams:
+            score = f"{c['score']:.0f}" if c.get("score") is not None else ""
+            item = QtWidgets.QTreeWidgetItem(
+                [c["name"], "●" if c.get("reference") else "", score])
+            if c.get("reference"):
+                item.setForeground(1, QtGui.QBrush(QtGui.QColor(ACCENT)))
+            self.cam_tree.addTopLevelItem(item)
+            if c["name"] == current:
+                self.cam_tree.setCurrentItem(item)
+        self.cam_tree.blockSignals(False)
+        self.chk_apply_on_select.setChecked(
+            bool(self.ctrl.session.settings.get("apply_on_select", True)))
+        if self.cam_tree.currentItem() is None and self.cam_tree.topLevelItemCount():
+            self.cam_tree.setCurrentItem(self.cam_tree.topLevelItem(0))
+        self.rebuild_rig_controls()
+
+    def _on_camera_selected(self, item, _prev):
+        if item is None:
+            return
+        name = item.text(0)
+        try:
+            for w in self.ctrl.select_camera(name):
+                self._log("⚠ " + w)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"select failed: {e}")
+        self._show_reference(name)
+        self._rebuild_locks(name)
+        self.rebuild_rig_controls()
+
+    def _on_apply_on_select(self, checked: bool):
+        self.ctrl.session.settings["apply_on_select"] = bool(checked)
+        self.ctrl.save_session()
+
+    # ================================================================= reference
+    def _pick_reference(self):
+        cam = self._current_camera()
+        if not cam:
+            self._log("select a camera first")
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, f"Reference for {cam}", "", "Images (*.jpg *.jpeg *.png *.webp)")
+        if not path:
+            return
+        self.ctrl.session.set_reference(cam, path)
+        self.ctrl.save_session()
+        self._show_reference(cam)
+        self.refresh_cameras()
+
+    def _show_reference(self, cam: str):
+        e = self.ctrl.session.cameras.get(cam)
+        ref = e.reference if e else ""
+        if ref and os.path.exists(ref):
+            pix = QtGui.QPixmap(ref)
+            if not pix.isNull():
+                self.ref_thumb.setPixmap(pix.scaled(
+                    self.ref_thumb.size(), QtCore.Qt.KeepAspectRatio,
+                    QtCore.Qt.SmoothTransformation))
+                info = os.path.basename(ref)
+                if e and e.semantics:
+                    s = e.semantics
+                    info += (f"\n{s.get('time_of_day')}, {s.get('sky')} sky, "
+                             f"wb ~{s.get('wb_kelvin_estimate', 0):.0f}K")
+                if e and e.score is not None:
+                    info += f"\nlast match: {e.score:.1f}/100 at {e.matched_at}"
+                self.lbl_ref_info.setText(info)
+                return
+        self.ref_thumb.setPixmap(QtGui.QPixmap())
+        self.ref_thumb.setText("no reference")
+        self.lbl_ref_info.setText("Bind a lighting reference image to this camera.")
+
+    def _rebuild_locks(self, cam: str):
+        self.lock_list.clear()
+        e = self.ctrl.session.cameras.get(cam)
+        locked = set(e.locks) if e else set()
+        try:
+            state = self.ctrl.read_state(cam)
+        except Exception:
+            state = LightingState()
+        for key in sorted(state.keys()):
+            it = QtWidgets.QListWidgetItem(key)
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Checked if key in locked else QtCore.Qt.Unchecked)
+            self.lock_list.addItem(it)
+
+    def _locks(self) -> set:
+        out = set()
+        for i in range(self.lock_list.count()):
+            it = self.lock_list.item(i)
+            if it.checkState() == QtCore.Qt.Checked:
+                out.add(it.text())
+        return out
+
+    # ================================================================= rig sliders
+    def rebuild_rig_controls(self):
+        while self.rig_form.rowCount() > 1:      # row 0 = the buttons row
+            self.rig_form.removeRow(1)
+        self._sliders.clear()
+        try:
+            state = self.ctrl.read_state(self._current_camera())
+        except Exception as e:  # noqa: BLE001
+            self.rig_form.addRow(QtWidgets.QLabel(f"rig read failed: {e}"))
+            return
+        for key in sorted(state.keys()):
+            spec = spec_for(key)
+            if spec is None:
+                continue
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(spec.lo, spec.hi)
+            spin.setDecimals(2)
+            spin.setSingleStep(1.0 if spec.hi - spec.lo > 20 else 0.1)
+            spin.setValue(state.get(key))
+            spin.valueChanged.connect(lambda v, k=key: self._on_slider(k, v))
+            self._sliders[key] = spin
+            self.rig_form.addRow(key, spin)
+
+    def _on_slider(self, key: str, value: float):
+        if not self.chk_live.isChecked() or self._busy:
+            return
+        st = LightingState()
+        if key.startswith(GROUP_PREFIX):
+            st.groups[key[len(GROUP_PREFIX):]] = value
+        else:
+            st.set(key, value)
+        try:
+            self.ctrl.apply_state(st, self._current_camera())
+        except Exception as e:  # noqa: BLE001
+            self._log(f"apply failed: {e}")
+
+    # ================================================================= match
+    def _start_match(self):
+        if self._busy:
+            return
+        cam = self._current_camera()
+        if not cam:
+            self._log("select a camera first")
+            return
+        e = self.ctrl.session.cameras.get(cam)
+        if not (e and e.reference):
+            self._log("bind a reference image first")
+            return
+        if not self.cfg.api_key:
+            self._log("no API key — open Settings and paste your oc_ key")
+            return
+        self._busy = True
+        self._cancel = False
+        self.btn_match.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.cfg.max_iterations = int(self.spin_iters.value())
+        self.cfg.target_score = float(self.spin_target.value())
+        self.log.clear()
+        self._log(f"— match: {cam} —")
+        try:
+            # run_match stays on the MAIN thread (it applies states and renders); its
+            # gateway calls come back through ctrl.io → _run_blocking_io, so the UI
+            # breathes and Cancel stays clickable during LLM waits.
+            result = self.ctrl.run_match(
+                cam, log=self._log,
+                should_cancel=lambda: self._cancel,
+                locks=self._locks(),
+                do_sweep=self.chk_sweep.isChecked())
+            score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
+            self._log(f"✓ done ({result.stop_reason}) — best {score}")
+        except (OmegaError, RuntimeError) as err:
+            self._log(f"✗ {err}")
+        except Exception as err:  # noqa: BLE001
+            self._log(f"✗ unexpected: {err}")
+        finally:
+            self._busy = False
+            self.btn_match.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
+            self.refresh_cameras()
+            self.rebuild_rig_controls()
+            self._show_reference(cam)
+
+    def _cancel_match(self):
+        self._cancel = True
+        self._log("cancelling after the current step…")
+
+    def _open_run_dir(self):
+        d = self.ctrl._run_dir or cfgmod.sessions_dir()
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(d))
+
+    # ================================================================= vantage
+    def _start_live_link(self):
+        ok, how = self.ctrl.start_live_link()
+        self.lbl_link.setText(("link: started — " if ok else "link: ") + how)
+        self._log(("vantage live link: " if ok else "⚠ vantage live link: ") + how)
+
+    def _vantage_render(self, selected_only: bool):
+        if self._busy:
+            return
+        cams = ([self._current_camera()] if selected_only
+                else self.ctrl.session.cameras_with_states())
+        cams = [c for c in cams if c]
+        if not cams:
+            self._log("no cameras to render (match or save states first)")
+            return
+        out_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Output folder")
+        if not out_dir:
+            return
+        self._busy = True
+        try:
+            results = self.ctrl.vantage_render_cameras(
+                cams, out_dir, on_progress=lambda c, s: self._log(f"vantage {c}: {s}"))
+            for cam, status in results.items():
+                self._log(f"{'✓' if status == 'ok' else '✗'} {cam}: {status}")
+        except Exception as e:  # noqa: BLE001
+            self._log(f"✗ vantage batch: {e}")
+        finally:
+            self._busy = False
+
+    # ================================================================= settings
+    def _open_settings(self):
+        dlg = SettingsDialog(self.cfg, self)
+        if dlg.exec():
+            self.cfg.save()
+            self.ctrl.cfg = self.cfg
+            self._log("settings saved")
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, cfg: cfgmod.Config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MaxGaffer — settings")
+        self.setStyleSheet(STYLE)
+        self.cfg = cfg
+        form = QtWidgets.QFormLayout(self)
+        self.ed_key = QtWidgets.QLineEdit(cfg.api_key)
+        self.ed_key.setEchoMode(QtWidgets.QLineEdit.Password)
+        form.addRow("oc_ API key", self.ed_key)
+        self.ed_model = QtWidgets.QLineEdit(cfg.model)
+        form.addRow("model", self.ed_model)
+        self.ed_vantage = QtWidgets.QLineEdit(cfg.vantage_console)
+        form.addRow("vantage_console.exe", self.ed_vantage)
+        self.ed_syspy = QtWidgets.QLineEdit(cfg.system_python)
+        self.ed_syspy.setPlaceholderText("optional: python.exe with Pillow (sidecar)")
+        form.addRow("system python", self.ed_syspy)
+        res = QtWidgets.QHBoxLayout()
+        self.sp_w = QtWidgets.QSpinBox()
+        self.sp_w.setRange(160, 1920)
+        self.sp_w.setValue(cfg.loop_width)
+        self.sp_h = QtWidgets.QSpinBox()
+        self.sp_h.setRange(90, 1080)
+        self.sp_h.setValue(cfg.loop_height)
+        res.addWidget(self.sp_w)
+        res.addWidget(QtWidgets.QLabel("×"))
+        res.addWidget(self.sp_h)
+        form.addRow("loop render size", res)
+        self.lbl_status = QtWidgets.QLabel("")
+        self.lbl_status.setObjectName("dim")
+        form.addRow(self.lbl_status)
+        btns = QtWidgets.QHBoxLayout()
+        b_test = QtWidgets.QPushButton("Test gateway")
+        b_test.clicked.connect(self._test)
+        btns.addWidget(b_test)
+        b_ok = QtWidgets.QPushButton("Save")
+        b_ok.setObjectName("primary")
+        b_ok.clicked.connect(self._save)
+        btns.addWidget(b_ok)
+        b_cancel = QtWidgets.QPushButton("Cancel")
+        b_cancel.clicked.connect(self.reject)
+        btns.addWidget(b_cancel)
+        form.addRow(btns)
+
+    def _test(self):
+        self.lbl_status.setText("pinging…")
+        QtWidgets.QApplication.processEvents()
+        try:
+            self.lbl_status.setText(ping(self.ed_key.text().strip(),
+                                         self.ed_model.text().strip()))
+            self.lbl_status.setStyleSheet(f"color:{OK};")
+        except OmegaError as e:
+            self.lbl_status.setText(str(e))
+            self.lbl_status.setStyleSheet(f"color:{ERR};")
+
+    def _save(self):
+        self.cfg.api_key = self.ed_key.text().strip()
+        self.cfg.model = self.ed_model.text().strip() or "claude-opus-4-8"
+        self.cfg.vantage_console = self.ed_vantage.text().strip()
+        self.cfg.system_python = self.ed_syspy.text().strip()
+        self.cfg.loop_width = int(self.sp_w.value())
+        self.cfg.loop_height = int(self.sp_h.value())
+        self.accept()
+
+
+_dock_instance: Optional[MaxGafferDock] = None
+
+
+def show_dock():
+    """Create (or raise) the dock inside 3ds Max's main window."""
+    global _dock_instance
+    parent = None
+    try:
+        import qtmax  # Max 2021+
+
+        parent = qtmax.GetQMaxMainWindow()
+    except Exception:
+        parent = None
+    if _dock_instance is not None:
+        try:
+            _dock_instance.show()
+            _dock_instance.raise_()
+            return _dock_instance
+        except RuntimeError:
+            _dock_instance = None
+    if parent is not None:
+        dock = QtWidgets.QDockWidget("MaxGaffer", parent)
+        dock.setObjectName("MaxGafferDock")
+        widget = MaxGafferDock(dock)
+        dock.setWidget(widget)
+        parent.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+        dock.setFloating(True)
+        dock.resize(760, 900)
+        dock.show()
+        _dock_instance = widget
+    else:  # dev fallback: plain window
+        _dock_instance = MaxGafferDock()
+        _dock_instance.resize(760, 900)
+        _dock_instance.show()
+    return _dock_instance

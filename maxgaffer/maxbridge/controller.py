@@ -271,6 +271,13 @@ class Controller:
         if cam is None:
             raise RuntimeError(f"camera '{camera_name}' not found in the scene")
         sc.set_active_camera(camera_name)
+        if self.cfg.auto_exposure_control:
+            from .exposure import ExposureHost, ensure_exposure_control
+
+            if ExposureHost(cam).kind == "none":
+                created = ensure_exposure_control()
+                if created:
+                    log("⚠ " + created)
         locks = set(locks if locks is not None else e.locks)
         run_dir = self._new_run_dir(camera_name)
         log(f"run dir: {run_dir}")
@@ -485,10 +492,52 @@ class Controller:
 
     def run_vantage_jobs(self, jobs: List[Dict],
                          on_progress: Callable[[str, str], None]) -> Dict[str, str]:
-        """Pure-subprocess half — NO pymxs, safe to run on a worker thread so a multi-hour
-        vantage_console batch never freezes Max."""
+        """LEGACY (Developer-Edition CLI only) — pure subprocess, worker-thread safe."""
         return vt.render_stills(jobs, self.cfg.vantage_console,
                                 self.cfg.final_width, self.cfg.final_height, on_progress)
+
+    def render_finals_vray(
+        self,
+        camera_names: List[str],
+        out_dir: str,
+        on_progress: Callable[[str, str], None],
+    ) -> Dict[str, str]:
+        """DEFAULT final-render backend (stock Vantage 3.x has no headless CLI): per
+        camera, apply its saved state and production-render through V-Ray at final res.
+        MAIN THREAD — renders block Max by nature; progress narrates between shots."""
+        results: Dict[str, str] = {}
+        os.makedirs(out_dir, exist_ok=True)
+        for name in camera_names:
+            on_progress(name, "applying state")
+            e = self.session.cameras.get(name)
+            if e and e.state is not None:
+                self.apply_state(e.state, name)
+            cam = sc.get_camera(name)
+            if cam is None:
+                results[name] = "camera not found"
+                on_progress(name, results[name])
+                continue
+            on_progress(name, f"rendering {self.cfg.final_width}×{self.cfg.final_height} (V-Ray)")
+            out = rd.render_frame(cam, os.path.join(out_dir, f"{_safe(name)}.png"),
+                                  self.cfg.final_width, self.cfg.final_height)
+            results[name] = "ok" if out else "render failed"
+            on_progress(name, results[name])
+        return results
+
+    def export_and_open_vantage(
+        self,
+        camera_names: List[str],
+        on_progress: Callable[[str, str], None],
+    ) -> Tuple[List[Dict], bool, str]:
+        """Vantage-quality path on stock 3.3: export per-camera vrscenes (each with its
+        matched light applied) and open Vantage — drop them into its in-app Batch Render
+        queue. Returns (jobs, vantage_launched, export_dir)."""
+        jobs = self.prepare_vantage_jobs(camera_names, cfgmod.sessions_dir(), on_progress,
+                                         use_saved_states=True)
+        export_dir = os.path.dirname(jobs[0]["scene_file"]) if jobs else ""
+        launched = vt.launch_vantage(self.cfg.vantage_exe,
+                                     jobs[0]["scene_file"] if jobs else None)
+        return jobs, launched, export_dir
 
     # ------------------------------------------------------------------ dirs
     def _ensure_run_dir(self, sub: str) -> str:

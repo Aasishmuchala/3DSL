@@ -3,7 +3,7 @@
 **Owner:** Aasish Muchala · **Type:** internal Sthyra pipeline tool (not sold) ·
 **Target:** 3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x ·
 **Sibling of:** MaxDirector (same Omega gateway, same hexagon, key borrowed automatically) ·
-**Status:** v0.3.2 recheck-hardened 2026-07-16 · 85 tests green · UI executed offscreen · gateway smoke 4/4 · sim Phase A 98.8 asserted ·
+**Status:** v0.4.0 STACK-VERIFIED 2026-07-16 (official docs: V-Ray 7 · Vantage 3.3 · Max 2026 Py 3.11.9) · 86 tests green · gateway smoke 4/4 · sim Phase A 98.8 asserted ·
 awaiting on-box bring-up (tasks/plan.md P0).
 
 ## 1. Summary
@@ -29,9 +29,9 @@ matched cameras through vantage_console" is one button.
 | Threading | pymxs on Max's MAIN thread, always · gateway/sidecar/vantage-batch on workers via injectable `io` runner · worker progress → Qt signal relay · camera board locked while a run is live |
 | Dependencies | **stdlib floor** (urllib client + built-in PNG reader — loop stats can never fail); Pillow optional upgrade; no torch, no OpenCV, no required pip package |
 | Loop renders | in-Max V-Ray at `loop_width` (480 px), VFB off, size save/restored — **sampler settings are never touched** (render setups belong to the artist) |
-| Final renders | per-camera: apply saved state → `vrayExportVRScene` → `vantage_console` sequential CLI (`-scenefile -outputFile -outputWidth -outputHeight -frames`, MaxDirector-verified shape) |
+| Final renders | DEFAULT: per-camera V-Ray production renders in Max (stock **Vantage 3.x removed its render CLI** — Chaos-confirmed, Dev Edition only). Vantage-quality path: per-camera `vrayExportVRScene` (verified `startFrame:/endFrame:`) → Vantage in-app Batch Render queue via one-click export+launch. Legacy CLI kept behind `final_render_backend:"vantage_cli"` |
 | Dome rotation | HDRI texmap horizontal-rotation spinner first; fallback **world-Z rotation at pivot via explicit matrix composition** W·T(−p)·Rz·T(p) (never `rt.rotate` — context-dependent coordsys) |
-| Exposure hosts | scene V-Ray exposure control → Physical/VRayPhysical camera (EV realized via **ISO only**; f-stop/shutter are DOF/motion, not light) → none (auto-lock). All moves RELATIVE, so unit-misread bias cancels |
+| Exposure hosts | scene V-Ray exposure control (auto-created via verified `vrayCreateVRayExposureControl()` when absent) → native Physical camera **direct Target-EV** (`exposure_gain_type=1` + `exposure_value`, doc-verified) → legacy VRayPhysical via ISO math (`shutter_speed` is 1/s vs native `shutter_length_seconds` — units handled per-property) → none (auto-lock) |
 | WB conventions | spinner-kelvin ≡ swatch = illuminant color (`kelvin_to_rgb(K)` directly, no mired mirror); higher K → warmer render; on-box item #6 is the one visual sign check |
 | Persistence | `<scene>.maxgaffer.json` sidecar (cameras, states, locks, semantics cache, pre-match, baselines, settings); unsaved scene → in-memory + loud warning |
 | Property access | candidates-tuples everywhere, per-parameter fault isolation, gaps recorded in `rig["notes"]` and surfaced in the log |

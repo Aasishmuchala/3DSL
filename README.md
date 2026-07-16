@@ -8,8 +8,9 @@ lighting reference image, press **MATCH LIGHTING** — and MaxGaffer analyzes th
 first-guesses a rig from gaffer craft tables, then iterates the scene's **sun, HDRI dome,
 exposure, white balance and practical-light groups** until the render's light matches the
 reference — while the **Chaos Vantage live link mirrors every step in real time**. Each
-camera keeps its own matched lighting state, so "render every shot under its own light
-through Vantage" is one button.
+camera keeps its own matched lighting state, so "render every shot under its own light" is
+one button (V-Ray finals in Max — stock Vantage 3.x has no headless CLI — plus one-click
+per-camera vrscene exports for Vantage's in-app Batch Render queue).
 
 Target: **3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x.** Internal Sthyra
 pipeline tool, sibling of MaxDirector (same Omega gateway, same hexagon architecture, same
@@ -103,6 +104,20 @@ WB walked monotonically to target; Phase B full live pipeline reported 85.1 best
 Live fire also caught and fixed two real defects: Cloudflare rejecting UA-less urllib
 (client now sends a User-Agent) and the LLM overriding solver-owned exposure (now
 structurally refused, not just prompted).
+
+**Verified against the official docs (2026-07-16) — V-Ray 7 · Vantage 3.3 · Max 2026:**
+
+| Fact | Consequence in MaxGaffer |
+|---|---|
+| VRaySun props are `.enabled .turbidity .ozone .intensity_multiplier .size_multiplier .sky_model` | candidate tuples confirmed, checklist #1 pre-cleared |
+| VRayLight `.on` + `.type` (0 Plane · **1 Dome** · 2 Sphere · 3 Mesh) `.multiplier` | dome detection confirmed, #2 pre-cleared |
+| Max Physical Camera: `exposure_gain_type` (1=Target) + **`exposure_value` = direct EV**; `f_number`; `shutter_length_seconds` (a DURATION — legacy VRayPhysical's `shutter_speed` is a 1/s SPEED); `white_balance_type` (1=Temperature) + `white_balance_kelvin` | EV now written directly via Target mode (no ISO math on native cams); shutter units handled per-property; WB enum confirmed |
+| V-Ray exposure control created via `vrayCreateVRayExposureControl()`; needs "Use 3ds Max photometric scale" | auto-created when a scene has no exposure host (`auto_exposure_control`) |
+| **Vantage 2.0+ removed stock command-line rendering** (Chaos support-confirmed; Developer Edition only) | finals default to the **V-Ray backend in Max**; per-camera vrscene export + "open Vantage" feeds the in-app Batch Render queue; CLI path kept behind `final_render_backend:"vantage_cli"` |
+| Live link = V-Ray toolbar action "Initiate a Live-Link to Chaos Vantage", port 20701, starts Vantage itself, **same action toggles off** | actionMan scan targets that label; UI button labeled as a toggle |
+| VRaySky auto-binds to "the first **enabled** VRaySun" | `overcast_sun_mode` defaults to **"dim"** (sun kept alive at 0.05×) |
+| Max 2026 = Python **3.11.9** + PySide6 | install.bat's `Python311` user-site path confirmed |
+| `vrayExportVRScene "file" startFrame:N endFrame:N` (exports read **V-Ray GPU** render settings; geometry/lights/cameras export regardless) | export call confirmed; harmless for our use — Vantage ignores renderer settings |
 
 ### The checklist the runner automates
 

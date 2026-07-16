@@ -1,15 +1,18 @@
-"""Chaos Vantage — live link (the user's real-time monitor) + final-frame batch renders.
+"""Chaos Vantage — live link (the user's real-time monitor) + scene handoff.
 
-Live link: every apply the match loop makes syncs to Vantage instantly once the link is up,
-so the user literally watches the sun swing into place at full speed. Starting the link has
-no single documented MAXScript entry point across V-Ray builds, so we probe known globals
-first and then scan actionMan for the V-Ray menu action ("Chaos Vantage live link…") and
-execute it — with a clear "click the menu once" fallback message if neither lands.
-
-Batch: MaxDirector's verified CLI shape — export a .vrscene per camera (that camera active),
-then run vantage_console sequentially: -scenefile -outputFile -outputWidth -outputHeight
--frames. Per-camera lighting states are applied before each export, which is what turns the
-camera list into a one-click "render every shot with its own matched light" board.
+VERIFIED against Chaos docs/forums 2026-07-16, for Vantage 3.x:
+  * LIVE LINK — installed with V-Ray (5.1+ incl. 7) as the 3ds Max toolbar action
+    "Initiate a Live-Link to Chaos Vantage": it STARTS Vantage if needed, streams on port
+    20701 (20703 for V-Ray 7.3 DR2), and the SAME action TOGGLES the link off. We probe
+    legacy maxscript globals, then scan actionMan for that action text.
+  * COMMAND-LINE RENDERING WAS REMOVED in Vantage 2.0+ (Chaos support: "The command line
+    control has been removed"; it returned only in the paid Developer Edition). On stock
+    Vantage 3.3 there is NO -sceneFile/-outputFile headless render. Therefore:
+      - the DEFAULT final-render backend is V-Ray inside Max (fully scriptable);
+      - per-camera .vrscene exports remain first-class — drop them into Vantage's in-app
+        Batch Render queue (or double-click one) for Vantage-quality finals;
+      - the CLI runner below is kept ONLY for Developer-Edition/legacy consoles and is
+        gated behind config.final_render_backend == "vantage_cli".
 """
 
 from __future__ import annotations
@@ -35,8 +38,12 @@ def _rt():
 
 
 def start_live_link() -> Tuple[bool, str]:
-    """Try to start the Vantage live link. → (started?, how/diagnostic)."""
-    rt = _rt()
+    """Execute V-Ray's 'Initiate a Live-Link to Chaos Vantage' action (a TOGGLE — it also
+    stops an active link). → (executed?, how/diagnostic). Degrades off-Max."""
+    try:
+        rt = _rt()
+    except Exception:
+        return False, "pymxs unavailable (not running inside 3ds Max)"
     for expr in LIVE_LINK_GLOBALS:
         try:
             rt.execute(expr)
@@ -131,6 +138,18 @@ def vantage_command(console_exe: str, scene_file: str, output: str,
     ]
 
 
+def launch_vantage(vantage_exe: str, scene_file: Optional[str] = None) -> bool:
+    """Open Vantage (optionally on a vrscene) — the handoff for the in-app batch queue."""
+    if not os.path.exists(vantage_exe):
+        return False
+    try:
+        args = [vantage_exe] + ([scene_file] if scene_file else [])
+        subprocess.Popen(args, close_fds=True)
+        return True
+    except Exception:
+        return False
+
+
 def render_stills(
     jobs: List[Dict],                      # {camera, scene_file, output}
     console_exe: str,
@@ -138,8 +157,8 @@ def render_stills(
     height: int,
     on_progress: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, str]:
-    """Sequential vantage_console batch ("finish all sequences one by one"). Halts on the
-    first hard failure; earlier outputs stay on disk."""
+    """LEGACY/Developer-Edition ONLY: sequential vantage_console CLI batch. Stock Vantage
+    2.0+ removed these flags — use the V-Ray backend or the in-app batch queue instead."""
     results: Dict[str, str] = {}
     if not os.path.exists(console_exe):
         return {j["camera"]: f"vantage_console not found: {console_exe}" for j in jobs}

@@ -24,7 +24,7 @@ from .maxbridge import config as _config
 from .maxbridge.controller import Controller
 
 __all__ = ["match_camera", "match_all_cameras", "apply_camera_state",
-           "render_cameras_vantage", "get_controller"]
+           "render_cameras", "export_vrscenes_for_vantage", "get_controller"]
 
 _shared: Optional[Controller] = None
 
@@ -86,13 +86,29 @@ def apply_camera_state(camera_name: str) -> List[str]:
     return ctrl.apply_state(e.state, camera_name)
 
 
-def render_cameras_vantage(
+def render_cameras(
     camera_names: List[str],
     out_dir: str,
     on_progress: Callable[[str, str], None] = lambda c, s: None,
+    backend: str = "",
 ) -> Dict[str, str]:
-    """Apply each camera's saved state, export per-camera vrscenes, run the vantage_console
-    batch (BLOCKING — wrap in your own worker if you need Max responsive)."""
+    """Final renders, each camera under its saved matched light. Default backend renders
+    through V-Ray in Max (stock Vantage 3.x removed its render CLI); pass
+    backend="vantage_cli" only with a Developer-Edition console. BLOCKING, main thread."""
     ctrl = get_controller()
-    jobs = ctrl.prepare_vantage_jobs(camera_names, out_dir, on_progress)
-    return ctrl.run_vantage_jobs(jobs, on_progress)
+    backend = backend or ctrl.cfg.final_render_backend
+    if backend == "vantage_cli":
+        jobs = ctrl.prepare_vantage_jobs(camera_names, out_dir, on_progress)
+        return ctrl.run_vantage_jobs(jobs, on_progress)
+    return ctrl.render_finals_vray(camera_names, out_dir, on_progress)
+
+
+def export_vrscenes_for_vantage(
+    camera_names: List[str],
+    on_progress: Callable[[str, str], None] = lambda c, s: None,
+) -> List[Dict]:
+    """Per-camera .vrscene exports (matched light applied) + open Vantage for its in-app
+    Batch Render queue — the Vantage-quality finals path on stock 3.x."""
+    jobs, _launched, _dir = get_controller().export_and_open_vantage(
+        camera_names, on_progress)
+    return jobs

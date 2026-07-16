@@ -263,10 +263,13 @@ class MaxGafferDock(QtWidgets.QWidget):
         right.addWidget(g_rig)
 
         # vantage group
-        g_v = QtWidgets.QGroupBox("VANTAGE")
+        g_v = QtWidgets.QGroupBox("VANTAGE + FINALS")
         lv = QtWidgets.QVBoxLayout(g_v)
         vrow = QtWidgets.QHBoxLayout()
-        btn_link = QtWidgets.QPushButton("Start live link")
+        btn_link = QtWidgets.QPushButton("Live link (toggle)")
+        btn_link.setToolTip("Runs V-Ray's 'Initiate a Live-Link to Chaos Vantage' action: "
+                            "starts Vantage if needed, streams on port 20701. The SAME "
+                            "action stops the link — it is a toggle.")
         btn_link.clicked.connect(self._start_live_link)
         vrow.addWidget(btn_link)
         self.lbl_link = QtWidgets.QLabel("link: unknown")
@@ -275,12 +278,22 @@ class MaxGafferDock(QtWidgets.QWidget):
         lv.addLayout(vrow)
         vrow2 = QtWidgets.QHBoxLayout()
         btn_render_sel = QtWidgets.QPushButton("Final render (selected)")
-        btn_render_sel.clicked.connect(lambda: self._vantage_render(selected_only=True))
+        btn_render_sel.setToolTip("Renders through V-Ray in Max at final resolution — "
+                                  "stock Vantage 3.x has no headless CLI.")
+        btn_render_sel.clicked.connect(lambda: self._render_finals(selected_only=True))
         vrow2.addWidget(btn_render_sel)
-        btn_render_all = QtWidgets.QPushButton("Render ALL matched cameras")
-        btn_render_all.clicked.connect(lambda: self._vantage_render(selected_only=False))
+        btn_render_all = QtWidgets.QPushButton("Render ALL matched (V-Ray)")
+        btn_render_all.clicked.connect(lambda: self._render_finals(selected_only=False))
         vrow2.addWidget(btn_render_all)
         lv.addLayout(vrow2)
+        vrow3 = QtWidgets.QHBoxLayout()
+        btn_export_v = QtWidgets.QPushButton("Export vrscenes → open Vantage")
+        btn_export_v.setToolTip("Exports one .vrscene per matched camera (its light "
+                                "applied) and opens Vantage — add them to Vantage's "
+                                "in-app Batch Render queue for Vantage-quality finals.")
+        btn_export_v.clicked.connect(self._export_for_vantage)
+        vrow3.addWidget(btn_export_v)
+        lv.addLayout(vrow3)
         right.addWidget(g_v)
         right.addStretch(1)
 
@@ -631,12 +644,15 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.lbl_link.setText(("link: started — " if ok else "link: ") + how)
         self._log(("vantage live link: " if ok else "⚠ vantage live link: ") + how)
 
-    def _vantage_render(self, selected_only: bool):
-        if self._busy:
-            return
+    def _final_targets(self, selected_only: bool):
         cams = ([self._current_camera()] if selected_only
                 else self.ctrl.session.cameras_with_states())
-        cams = [c for c in cams if c]
+        return [c for c in cams if c]
+
+    def _render_finals(self, selected_only: bool):
+        if self._busy:
+            return
+        cams = self._final_targets(selected_only)
         if not cams:
             self._log("no cameras to render (match or save states first)")
             return
@@ -645,20 +661,44 @@ class MaxGafferDock(QtWidgets.QWidget):
             return
         self._busy = True
         try:
-            # main-thread half: apply states + export vrscenes (pymxs)
-            jobs = self.ctrl.prepare_vantage_jobs(
-                cams, out_dir, on_progress=lambda c, s: self._log(f"vantage {c}: {s}"))
-            # worker half: the vantage_console batch is pure subprocess — run it off-main
-            # so a multi-hour batch never freezes Max; progress marshals back via signal
-            relay = _ProgressRelay()
-            relay.progress.connect(lambda c, s: self._log(f"vantage {c}: {s}"))
-            results = self._run_blocking_io(
-                lambda: self.ctrl.run_vantage_jobs(
-                    jobs, on_progress=lambda c, s: relay.progress.emit(c, s)))
+            if self.cfg.final_render_backend == "vantage_cli":
+                # Developer-Edition CLI only — exports main-thread, renders on a worker
+                jobs = self.ctrl.prepare_vantage_jobs(
+                    cams, out_dir, on_progress=lambda c, s: self._log(f"vantage {c}: {s}"))
+                relay = _ProgressRelay()
+                relay.progress.connect(lambda c, s: self._log(f"vantage {c}: {s}"))
+                results = self._run_blocking_io(
+                    lambda: self.ctrl.run_vantage_jobs(
+                        jobs, on_progress=lambda c, s: relay.progress.emit(c, s)))
+            else:
+                results = self.ctrl.render_finals_vray(
+                    cams, out_dir, on_progress=lambda c, s: self._log(f"final {c}: {s}"))
             for cam, status in results.items():
                 self._log(f"{'✓' if status == 'ok' else '✗'} {cam}: {status}")
         except Exception as e:  # noqa: BLE001
-            self._log(f"✗ vantage batch: {e}")
+            self._log(f"✗ final renders: {e}")
+        finally:
+            self._busy = False
+
+    def _export_for_vantage(self):
+        if self._busy:
+            return
+        cams = self._final_targets(selected_only=False)
+        if not cams:
+            self._log("no matched cameras to export")
+            return
+        self._busy = True
+        try:
+            jobs, launched, export_dir = self.ctrl.export_and_open_vantage(
+                cams, on_progress=lambda c, s: self._log(f"export {c}: {s}"))
+            self._log(f"✓ {len(jobs)} vrscene(s) → {export_dir}")
+            self._log("Vantage opened — add the files to its Batch Render queue"
+                      if launched else
+                      f"⚠ could not launch Vantage ({self.cfg.vantage_exe}) — open the "
+                      "folder manually")
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(export_dir))
+        except Exception as e:  # noqa: BLE001
+            self._log(f"✗ vantage export: {e}")
         finally:
             self._busy = False
 

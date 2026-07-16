@@ -26,7 +26,13 @@ CONFIG_PATH = os.path.join(_appdata_dir("MaxGaffer"), "config.json")
 class Config:
     api_key: str = ""                        # oc_ gateway key
     model: str = "claude-opus-4-8"           # vision-capable — the loop shows it images
+    vantage_exe: str = r"C:\Program Files\Chaos\Vantage\vantage.exe"
+    # Vantage 3.x REMOVED stock command-line rendering (Chaos support-confirmed; it now
+    # needs the Developer Edition). Default backend renders finals through V-Ray in Max —
+    # fully scriptable tonight. "vantage_cli" only works with a Dev Edition console exe.
+    final_render_backend: str = "vray"       # "vray" | "vantage_cli"
     vantage_console: str = r"C:\Program Files\Chaos\Vantage\vantage_console.exe"
+    auto_exposure_control: bool = True       # create a V-Ray exposure control if none exists
     system_python: str = ""                  # optional Pillow-equipped python for the sidecar
     loop_width: int = 480                    # iteration-render size (speed over beauty)
     loop_height: int = 270
@@ -37,7 +43,10 @@ class Config:
     sweep_count: int = 8
     keep_runs: int = 10                      # run folders kept per camera (0 = keep all)
     draft_sampler: bool = False              # opt-in: draft render settings during matches
-    overcast_sun_mode: str = "disable"       # or "dim" if VRaySky is sun-coupled (chk #13)
+    # "dim" is the DOC-BACKED default: VRaySky auto-binds to "the first enabled VRaySun"
+    # (Chaos docs/forums), so disabling the sun can gut a VRaySky environment. "disable"
+    # remains available for dome-only rigs.
+    overcast_sun_mode: str = "dim"
     critic_weights: Dict[str, float] = field(default_factory=dict)   # override critic defaults
     repo_path: str = ""                      # clone folder, written by install.bat
 

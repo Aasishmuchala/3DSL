@@ -70,17 +70,33 @@ def test_api_imports_and_exposes_contract():
     from maxgaffer import api
 
     assert set(api.__all__) == {"match_camera", "match_all_cameras", "apply_camera_state",
-                                "render_cameras_vantage", "get_controller"}
+                                "render_cameras", "export_vrscenes_for_vantage",
+                                "get_controller"}
     sig = inspect.signature(api.match_camera)
     assert list(sig.parameters) == ["camera_name", "reference_path", "log",
                                     "should_cancel", "locks", "sweep", "config_overrides"]
 
 
 # --------------------------------------------------------------- config completeness
-def test_config_has_all_v03_fields():
+def test_config_reflects_verified_stack():
     from maxgaffer.maxbridge.config import Config
 
     cfg = Config()
     assert cfg.draft_sampler is False               # opt-in, never default-on
-    assert cfg.overcast_sun_mode == "disable"
+    # VRaySky auto-binds to "the first enabled VRaySun" (doc-verified) → dim by default
+    assert cfg.overcast_sun_mode == "dim"
     assert cfg.keep_runs == 10
+    # stock Vantage 3.x has no render CLI (Chaos support-confirmed) → V-Ray backend
+    assert cfg.final_render_backend == "vray"
+    assert cfg.vantage_exe.endswith("vantage.exe")
+    assert cfg.auto_exposure_control is True
+
+
+def test_shutter_seconds_units():
+    """Native Physical stores a DURATION (shutter_length_seconds); legacy VRayPhysical
+    stores a SPEED (shutter_speed, 1/s) — mixing them up is a silent 4-6 stop EV error."""
+    from maxgaffer.maxbridge.exposure import shutter_seconds
+
+    assert shutter_seconds("shutter_length_seconds", 0.005) == 0.005
+    assert abs(shutter_seconds("shutter_speed", 200.0) - 0.005) < 1e-12
+    assert shutter_seconds("shutter_speed", 0.0) > 0          # guarded against div-zero

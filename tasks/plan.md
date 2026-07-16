@@ -91,10 +91,9 @@ per-shot cost known → decide default iterations/sweep for heavy scenes.
 | 10 | ✅ **shipped v0.3** — `maxgaffer/api.py`: match_camera / match_all_cameras / apply_camera_state / render_cameras_vantage | MaxDirector's LightMatch stage |
 
 ## Risks (top 5)
-1. **WB direction inverted on box** (#6) — one visual check, one-line flip. Do it FIRST.
-2. **Live-link has no scriptable entry** (#9) — degraded path already shipped (manual menu
-   click once per session); pin the action label when known.
-3. **Loop render cost on heavy interiors** — mitigations exist (res, iterations, sweep off,
+1. **WB direction inverted on box** (#6) — one visual check, one-line flip. Do it FIRST. (WB enum + kelvin prop now doc-verified on native Physical; visual check remains for the render's response.)
+2. **Live-link** (#9) — doc-verified: it's the V-Ray toolbar action "Initiate a Live-Link to Chaos Vantage" (port 20701, TOGGLE). actionMan scan targets that exact label; manual click stays the fallback.
+3. **Vantage CLI removed in 3.x (doc/support-verified)** — finals ship via the V-Ray backend by default; vrscene export + in-app batch queue is the Vantage-quality path. 4. **Loop render cost on heavy interiors** — mitigations exist (res, iterations, sweep off,
    CPU mode); measure at P1/P2 before adding machinery (#4 backlog).
 4. **Albedo trap in daily use** — leash + diagnosis shipped; if it fires constantly on real
    pairs, revisit weights (`config.critic_weights`) with logged run data.

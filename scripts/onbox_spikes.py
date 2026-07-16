@@ -229,14 +229,22 @@ def main():
                           cams[0]["name"] if cams else None)
         or (_ for _ in ()).throw(RuntimeError("vrayExportVRScene missing/failed"))))
 
-    # ---------- M vantage_console (#8)
-    check("M/#8", "vantage_console.exe", lambda: (
-        cfg.vantage_console if os.path.exists(cfg.vantage_console)
-        else (_ for _ in ()).throw(RuntimeError(f"not found: {cfg.vantage_console}"))))
+    # ---------- M vantage executable (#8) — stock 3.x has NO render CLI; finals default
+    # to the V-Ray backend, vantage.exe is only needed for live link / manual batch queue
+    check("M/#8", "vantage.exe (handoff)", lambda: (
+        cfg.vantage_exe if os.path.exists(cfg.vantage_exe)
+        else (_ for _ in ()).throw(RuntimeError(
+            f"not found: {cfg.vantage_exe} — set config.vantage_exe; live link can still "
+            "start Vantage via V-Ray's toolbar action"))))
+    if cfg.final_render_backend == "vantage_cli":
+        check("M2", "vantage_console.exe (Developer Edition CLI)", lambda: (
+            cfg.vantage_console if os.path.exists(cfg.vantage_console)
+            else (_ for _ in ()).throw(RuntimeError(f"not found: {cfg.vantage_console}"))))
 
-    # ---------- N live link probe (#9)
+    # ---------- N live link probe (#9) — NOTE: the V-Ray action is a TOGGLE; executing it
+    # here may genuinely start (or stop) a link session
     ok, how = vt.start_live_link()
-    RESULTS.append(("N/#9", "vantage live link", "PASS" if ok else "MANUAL", how))
+    RESULTS.append(("N/#9", "vantage live link (toggle action)", "PASS" if ok else "MANUAL", how))
     print(f"  [{'PASS' if ok else 'MANUAL'}] N/#9 vantage live link — {how}")
 
     # ---------- O draft sampler props (#15) — names only, nothing changed

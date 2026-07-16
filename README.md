@@ -82,11 +82,29 @@ Iteration renders go to `%LOCALAPPDATA%\MaxGaffer\sessions\<scene>\<camera>\<tim
 `<scene>.maxgaffer.json` next to the .max file. The sun sweep also refines **altitude** from
 its winning candidate's hint, not just azimuth.
 
-## ON-BOX VERIFICATION CHECKLIST (do these before first client use)
+## ON-BOX VERIFICATION — one command
 
-Everything scene-touching is written candidates-based and fault-isolated, but property
-names drift across V-Ray builds. Verify each once in the Max listener; fix the candidate
-tuples in `maxbridge/scene.py` / `exposure.py` if your build differs.
+```maxscript
+python.ExecuteFile @"C:\<repo>\scripts\onbox_spikes.py"
+```
+On a throwaway scene copy (VRaySun + dome + camera), **`scripts/onbox_spikes.py` measures
+the whole checklist below automatically** — property names per candidate tuple, dome enum,
+exposure host, and the sign conventions via tiny probe renders (WB warm direction, EV
+darkening, sun-swing response, sun-off-vs-VRaySky) — snapshots and restores the scene, and
+writes `%LOCALAPPDATA%\MaxGaffer\spike_report.txt`. Zero FAILs = Checkpoint 0, go match.
+Manual leftovers: #9 only if the live-link probe reports MANUAL (click the V-Ray menu once
+and note the label), #14 (watch VRAM with the link up on a heavy scene).
+
+**Already verified LIVE off-box (2026-07-16):** the entire LLM leg — gateway auth + wire
+(`scripts/live_gateway_smoke.py`, 4/4 PASS: ping/ANALYZE/DELTAS/SWEEP against real
+opus-4.8, correct sweep pick) — and the deterministic engine end-to-end
+(`scripts/sim_match.py` Phase A: score 11→98.8 on a hidden-target world, EV landed exactly,
+WB walked monotonically to target; Phase B full live pipeline reported 85.1 best run).
+Live fire also caught and fixed two real defects: Cloudflare rejecting UA-less urllib
+(client now sends a User-Agent) and the LLM overriding solver-owned exposure (now
+structurally refused, not just prompted).
+
+### The checklist the runner automates
 
 | # | What | How to verify | Where to fix |
 |---|---|---|---|

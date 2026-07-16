@@ -175,3 +175,32 @@ def test_prune_old_runs(tmp_path):
     assert left == ["20260704-090000", "20260705-090000"]     # newest survive
     assert prune_old_runs(str(tmp_path), keep=0) == 0          # 0 = keep everything
     assert prune_old_runs(str(tmp_path / "missing"), keep=2) == 0
+
+
+# --------------------------------------------------------------- analytic ownership (live-fire find)
+def test_llm_cannot_override_analytic_params_when_solver_active():
+    """Live sim showed the model setting exposure.ev despite prompt guidance — with the
+    solver active, analytic params must be structurally refused."""
+    reply = json.dumps({"assessment": "too dark", "changes": [
+        {"param": "exposure.ev", "value": 9.0, "why": "brighten"},
+        {"param": "exposure.wb_kelvin", "value": 4000.0, "why": "warm"},
+        {"param": "sun.turbidity", "value": 5.0, "why": "haze"}], "stop": False})
+    logs = []
+    hooks = hooks_with([near(0.18), near(0.18)], [reply], logs)
+    res = run_match(start_state(), REF, {}, hooks,
+                    MatchConfig(max_iterations=2, target_score=101, stall_patience=99))
+    it0 = res.iterations[0]
+    assert "exposure.ev" not in it0.llm_accepted
+    assert "exposure.wb_kelvin" not in it0.llm_accepted
+    assert "sun.turbidity" in it0.llm_accepted
+    assert sum("solver owns it" in r for r in it0.llm_rejected) == 2
+
+
+def test_llm_may_drive_exposure_in_llm_only_mode():
+    """No metrics → no solver → the model is the only exposure driver; must be allowed."""
+    reply = json.dumps({"assessment": "", "changes": [
+        {"param": "exposure.ev", "value": 11.0, "why": "brighten"}], "stop": False})
+    logs = []
+    hooks = hooks_with([], [reply], logs)
+    res = run_match(start_state(), None, {}, hooks, MatchConfig(max_iterations=2))
+    assert "exposure.ev" in res.iterations[0].llm_accepted

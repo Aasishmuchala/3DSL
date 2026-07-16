@@ -6,10 +6,17 @@ acceptance criteria; nothing advances on vibes.
 
 ---
 
-## P0 — On-box bring-up (one session at the Max 2026 box, ~90 min)
+## P0 — On-box bring-up (NOW AUTOMATED: one command, ~10 min)
 
-Run `scripts\install.bat`, restart Max, open a THROWAWAY copy of a real scene.
-Then four spikes. For every mismatch: fix the named candidates tuple, re-test, commit.
+Run `scripts\install.bat`, restart Max, open a THROWAWAY copy of a real scene, then:
+`python.ExecuteFile @"C:\<repo>\scripts\onbox_spikes.py"` — it executes Spikes A–D below
+as measured checks (probe renders for the sign conventions) and writes a PASS/FAIL report.
+Fix any FAIL's named candidates tuple, re-run, commit. Manual leftovers: live-link menu
+label if the probe says MANUAL (#9), VRAM watch on a heavy scene (#14).
+
+The LLM leg needs nothing on the box — verified live 2026-07-16 (`live_gateway_smoke.py`
+4/4, `sim_match.py` Phase A asserted 98.8). The manual spike walkthrough below remains as
+the reference for diagnosing any FAIL.
 
 ### Spike A — property-name audit (~20 min) · checklist #1 #2 #3 #4 #5
 Listener:

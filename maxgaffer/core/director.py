@@ -223,6 +223,17 @@ def run_match(
         rec.assessment = proposal["assessment"]
         if proposal["assessment"]:
             hooks.log(f"iter {i}: gaffer: {proposal['assessment']}")
+        # structural, not just prompted: while the analytic solver is running, ANALYTIC
+        # params are the solver's alone — live fire showed the model overriding a perfect
+        # EV solve and costing two iterations of re-correction (sim_match, 2026-07-16)
+        if cfg.analytic and metrics_ok:
+            from .genome import spec_for
+
+            for k in [k for k in proposal["changes"]
+                      if (spec_for(k) is not None and spec_for(k).analytic)]:
+                proposal["changes"].pop(k, None)
+                rec.llm_rejected.append(f"{k}: analytic — the solver owns it")
+                hooks.log(f"iter {i}: refused {k} (analytic — solver owns it)")
         # contaminated-iteration guard: if the solver just moved EV substantially, the
         # render the LLM critiqued was mis-exposed — drop its absolute-brightness moves
         # (rec.state snapshots the iteration-start values, so new-vs-start is the movement)

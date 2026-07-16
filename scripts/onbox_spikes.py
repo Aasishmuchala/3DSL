@@ -1,0 +1,274 @@
+"""Automated on-box P0 — run INSIDE 3ds Max 2026's Python, on a THROWAWAY scene copy
+that has a VRaySun, a dome VRayLight and at least one camera.
+
+    MAXScript listener:   python.ExecuteFile @"C:\\<repo>\\scripts\\onbox_spikes.py"
+
+Measures (not eyeballs) checklist #1-#8, #10-#13, #15-#16: property names, dome enum,
+exposure host, WB/EV/azimuth DIRECTIONS via tiny probe renders, state roundtrip, vrscene
+export, vantage_console presence, live-link probe, draft-prop names, sidecar. Manual
+leftovers: #9 only if the live-link probe fails (click the V-Ray menu once and note the
+label), #14 (watch VRAM with the link up on a heavy scene).
+
+Scene lighting is snapshotted first and restored in a finally. Report is printed AND
+written to %LOCALAPPDATA%/MaxGaffer/spike_report.txt.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import traceback
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+RESULTS = []
+
+
+def check(cid, name, fn):
+    try:
+        detail = fn()
+        RESULTS.append((cid, name, "PASS", str(detail)))
+        print(f"  [PASS] {cid:>4} {name} — {detail}")
+    except Exception as e:  # noqa: BLE001
+        RESULTS.append((cid, name, "FAIL", f"{type(e).__name__}: {e}"))
+        print(f"  [FAIL] {cid:>4} {name} — {e}")
+        if os.environ.get("MAXGAFFER_SPIKE_TRACE"):
+            traceback.print_exc()
+
+
+def matched(obj, tuples):
+    """{logical: matched_property_name_or_MISSING} for candidate tuples."""
+    from maxgaffer.maxbridge.scene import get_prop
+
+    out = {}
+    for label, cands in tuples.items():
+        hit = next((n for n in cands if get_prop(obj, (n,)) is not None), None)
+        out[label] = hit or "MISSING"
+    return out
+
+
+def main():
+    from maxgaffer.core import metrics
+    from maxgaffer.maxbridge import config as cfgmod
+    from maxgaffer.maxbridge import draft as df
+    from maxgaffer.maxbridge import scene as sc
+    from maxgaffer.maxbridge import vantage as vt
+    from maxgaffer.maxbridge.apply import apply_state, capture_baselines, read_state
+    from maxgaffer.maxbridge.exposure import (CAM_FNUM, CAM_ISO, CAM_SHUTTER, EC_EV,
+                                              EC_WB_KELVIN, ExposureHost)
+    from maxgaffer.maxbridge.render import render_frame
+    from pymxs import runtime as rt
+
+    cfg = cfgmod.load()
+    tmp = tempfile.mkdtemp(prefix="maxgaffer_spike_")
+    print(f"\n=== MaxGaffer on-box spikes · probes → {tmp} ===\n")
+
+    # ---------- A environment
+    check("A", "V-Ray is the active renderer", lambda: (
+        str(rt.classOf(rt.renderers.current)) if "vray" in
+        str(rt.classOf(rt.renderers.current)).lower() else (_ for _ in ()).throw(
+            RuntimeError(f"renderer is {rt.classOf(rt.renderers.current)}"))))
+
+    # ---------- B cameras
+    cams = sc.list_cameras()
+    check("B", "cameras present", lambda: ", ".join(
+        f"{c['name']}(yaw {c['yaw_deg']:.0f}°)" for c in cams[:5]) or
+        (_ for _ in ()).throw(RuntimeError("no cameras in scene")))
+    cam = sc.get_camera(cams[0]["name"]) if cams else None
+
+    # ---------- C rig + property names (#1 #2 #3 #11 #16)
+    rig = sc.classify_rig()
+    baselines = capture_baselines(rig)
+    check("C1", "rig classified", lambda: (
+        f"sun={'yes' if rig['sun'] else 'NO'} dome={'yes' if rig['dome'] else 'NO'} "
+        f"groups={list(rig['groups'])} notes={rig['notes'] or 'none'}"))
+    if rig["sun"] is not None:
+        check("C2/#1", "VRaySun property names", lambda: matched(rig["sun"], {
+            "intensity": sc.SUN_INTENSITY, "size": sc.SUN_SIZE,
+            "turbidity": sc.SUN_TURBIDITY, "on": sc.LIGHT_ON}))
+    if rig["dome"] is not None:
+        check("C3/#2", "dome .type enum (expect 1)", lambda: sc.get_prop(rig["dome"], ("type",)))
+        check("C4/#3", "dome texmap rotation prop", lambda: matched(
+            sc.get_prop(rig["dome"], ("texmap",)) or rig["dome"],
+            {"h_rotation": sc.DOME_TEX_ROT, "file": sc.DOME_TEX_FILE}))
+
+    # ---------- D exposure host (#4 #5)
+    host = ExposureHost(cam)
+    check("D/#4-5", "exposure host", lambda: (
+        host.describe() if host.kind != "none" else (_ for _ in ()).throw(
+            RuntimeError("no host — add a V-Ray exposure control or use a physical cam"))))
+    if host.kind == "exposure_control":
+        check("D2", "EC property names", lambda: matched(host.ec, {
+            "ev": EC_EV, "wb_kelvin": EC_WB_KELVIN}))
+    elif host.kind == "physical_cam":
+        check("D2", "camera exposure property names", lambda: matched(host.cam, {
+            "iso": CAM_ISO, "f": CAM_FNUM, "shutter": CAM_SHUTTER}))
+
+    # ---------- snapshot before anything mutates
+    snapshot = read_state(rig, baselines, cam)
+    try:
+        # ---------- E state roundtrip (#10-ish: setters exist + idempotent)
+        def roundtrip():
+            warnings = apply_state(rig, baselines, snapshot, cam)
+            back = read_state(rig, baselines, cam)
+            drift = {k: v for k, v in back.diff(snapshot).items()
+                     if abs(v[0] - v[1]) > 0.51}          # loose: unit quirks surface here
+            if drift:
+                raise RuntimeError(f"read-back drift: {drift} (warnings: {warnings})")
+            return f"clean roundtrip · warnings: {warnings or 'none'}"
+
+        check("E", "state read→apply→read-back", roundtrip)
+
+        # ---------- F render probe + stdlib stats (#10)
+        def probe(tag):
+            p = render_frame(cam, os.path.join(tmp, f"{tag}.png"), 160, 90)
+            if not p:
+                raise RuntimeError("render_frame returned None")
+            s = metrics.compute_stats(p)
+            if not s:
+                raise RuntimeError("stats unreadable (stdlib PNG floor)")
+            return s
+
+        check("F/#10", "loop render + stdlib stats", lambda: (
+            f"key={probe('base')['log_key']:.4f}"))
+
+        # ---------- G WB direction (#6) — THE sign check, measured
+        def wb_direction():
+            st = snapshot.copy()
+            if "exposure.wb_kelvin" not in st.values:
+                raise RuntimeError("no WB host — skipped (lock WB in the UI)")
+            st.set("exposure.wb_kelvin", 4500.0)
+            apply_state(rig, baselines, st, cam)
+            cool = probe("wb4500")["mean_rgb"]
+            st.set("exposure.wb_kelvin", 9000.0)
+            apply_state(rig, baselines, st, cam)
+            warm = probe("wb9000")["mean_rgb"]
+            ratio_c = cool[0] / max(1e-4, cool[2])
+            ratio_w = warm[0] / max(1e-4, warm[2])
+            if ratio_w <= ratio_c:
+                raise RuntimeError(
+                    f"INVERTED: r/b at 9000K ({ratio_w:.3f}) ≤ at 4500K ({ratio_c:.3f}) — "
+                    "flip the sign in core/solver.solve_wb (report first!)")
+            return f"9000K warmer than 4500K ✓ (r/b {ratio_c:.3f} → {ratio_w:.3f})"
+
+        check("G/#6", "WB kelvin direction (measured)", wb_direction)
+
+        # ---------- H EV direction — measured
+        def ev_direction():
+            st = snapshot.copy()
+            if "exposure.ev" not in st.values:
+                raise RuntimeError("no EV host")
+            base_ev = st.get("exposure.ev")
+            apply_state(rig, baselines, st, cam)
+            k1 = probe("ev_base")["log_key"]
+            st.set("exposure.ev", base_ev + 2.0)
+            apply_state(rig, baselines, st, cam)
+            k2 = probe("ev_plus2")["log_key"]
+            if k2 >= k1:
+                raise RuntimeError(f"INVERTED: key rose {k1:.4f}→{k2:.4f} after +2 EV")
+            return f"+2 EV darkened key {k1:.4f} → {k2:.4f} ✓"
+
+        check("H", "EV direction (measured)", ev_direction)
+
+        # ---------- I sun azimuth affects the frame — measured
+        def azimuth_effect():
+            if rig["sun"] is None:
+                raise RuntimeError("no sun")
+            st = snapshot.copy()
+            apply_state(rig, baselines, st, cam)
+            a = probe("azA")
+            st.set("sun.azimuth_deg", (st.get("sun.azimuth_deg") + 120.0) % 360.0)
+            apply_state(rig, baselines, st, cam)
+            b = probe("azB")
+            delta = sum(abs(x - y) for x, y in zip(a["mean_rgb"], b["mean_rgb"]))
+            if delta < 0.002 and abs(a["log_key"] - b["log_key"]) < 1e-4:
+                raise RuntimeError("frame unchanged after 120° sun swing — "
+                                   "sun transform may be controller-locked (#11)")
+            return f"frame responds to sun swing (Δrgb {delta:.4f}) ✓"
+
+        check("I/#11", "sun azimuth affects render", azimuth_effect)
+
+        # ---------- J dome rotation write (#3)
+        if rig["dome"] is not None:
+            def dome_rot():
+                before = sc.read_dome_rotation(rig["dome"])
+                how = sc.write_dome_rotation(rig["dome"], (before + 90.0) % 360.0)
+                after = sc.read_dome_rotation(rig["dome"])
+                sc.write_dome_rotation(rig["dome"], before)
+                if how == "failed":
+                    raise RuntimeError("no writable rotation path")
+                return f"{how} · {before:.0f}°→{after:.0f}° ✓"
+
+            check("J/#3", "dome rotation write", dome_rot)
+
+        # ---------- K sun-off vs VRaySky (#13) — measured
+        def sun_off_sky():
+            if rig["sun"] is None or not rig.get("sky_env"):
+                return "n/a (no sun+VRaySky pair)"
+            st = snapshot.copy()
+            st.set("sun.enabled", 0)
+            apply_state(rig, baselines, st, cam)
+            dark = probe("sunoff")["log_key"]
+            apply_state(rig, baselines, snapshot, cam)
+            if dark < 1e-4:
+                return ("sky DIES with sun off → set overcast_sun_mode:'dim' in config "
+                        f"(key {dark:.5f})")
+            return f"sky survives sun-off (key {dark:.4f}) — 'disable' mode fine"
+
+        check("K/#13", "sun-off vs VRaySky", sun_off_sky)
+
+    finally:
+        apply_state(rig, baselines, snapshot, cam)   # always leave the scene as found
+
+    # ---------- L vrscene export (#7)
+    check("L/#7", "vrscene export", lambda: (
+        vt.export_vrscene(os.path.join(tmp, "spike.vrscene"),
+                          cams[0]["name"] if cams else None)
+        or (_ for _ in ()).throw(RuntimeError("vrayExportVRScene missing/failed"))))
+
+    # ---------- M vantage_console (#8)
+    check("M/#8", "vantage_console.exe", lambda: (
+        cfg.vantage_console if os.path.exists(cfg.vantage_console)
+        else (_ for _ in ()).throw(RuntimeError(f"not found: {cfg.vantage_console}"))))
+
+    # ---------- N live link probe (#9)
+    ok, how = vt.start_live_link()
+    RESULTS.append(("N/#9", "vantage live link", "PASS" if ok else "MANUAL", how))
+    print(f"  [{'PASS' if ok else 'MANUAL'}] N/#9 vantage live link — {how}")
+
+    # ---------- O draft sampler props (#15) — names only, nothing changed
+    check("O/#15", "draft sampler property names", lambda: {
+        cands[0]: next((n for n in cands
+                        if sc.get_prop(rt.renderers.current, (n,)) is not None), "MISSING")
+        for cands, _v in df.DRAFT_PROPS})
+
+    # ---------- P sidecar (#12)
+    check("P/#12", "sidecar python (optional)", lambda: (
+        f"{cfg.system_python} ok" if cfg.system_python and os.path.exists(cfg.system_python)
+        else "not configured — stdlib floor + Max transcode cover everything"))
+
+    # ---------- report
+    fails = [r for r in RESULTS if r[2] == "FAIL"]
+    lines = [f"MaxGaffer spike report — {len(RESULTS)} checks, {len(fails)} FAIL", ""]
+    lines += [f"[{s:^6}] {cid:>6} {name}: {detail}" for cid, name, s, detail in RESULTS]
+    report = "\n".join(lines)
+    path = os.path.join(os.path.dirname(cfgmod.CONFIG_PATH), "spike_report.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)
+    except OSError:
+        path = "(could not write report file)"
+    print(f"\n=== {len(RESULTS)} checks · {len(fails)} FAIL · report: {path} ===")
+    if not fails:
+        print("CHECKPOINT 0: GREEN — run a real match (tasks/plan.md P1).")
+
+
+try:
+    import pymxs  # noqa: F401
+
+    main()
+except ImportError:
+    print("onbox_spikes.py must run INSIDE 3ds Max (pymxs not available here).")

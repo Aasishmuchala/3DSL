@@ -139,6 +139,7 @@ def run_match(
     cfg: Optional[MatchConfig] = None,
     locks: Optional[Set[str]] = None,
     rig_notes: str = "",
+    director_note: str = "",
 ) -> MatchResult:
     cfg = cfg or MatchConfig()
     locks = locks or set()
@@ -286,6 +287,7 @@ def run_match(
             "param_history": history_txt,
             "render_path": path,
             "rig_notes": rig_notes,
+            "director_note": director_note,
             "max_changes": cfg.max_changes,
         }
         try:

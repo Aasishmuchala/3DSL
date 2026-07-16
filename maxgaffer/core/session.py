@@ -37,6 +37,7 @@ class CameraEntry:
     locks: Set[str] = field(default_factory=set)
     semantics: Dict = field(default_factory=dict)   # cached ANALYZE result for the reference
     pre_match: Optional[LightingState] = None       # the light BEFORE the last match run
+    notes: List[str] = field(default_factory=list)  # director's notes, newest last
 
     def to_dict(self) -> Dict:
         return {
@@ -47,6 +48,7 @@ class CameraEntry:
             "locks": sorted(self.locks),
             "semantics": self.semantics,
             "pre_match": self.pre_match.to_dict() if self.pre_match else None,
+            "notes": list(self.notes),
         }
 
     @classmethod
@@ -61,6 +63,7 @@ class CameraEntry:
             locks=set(x for x in (d.get("locks") or []) if isinstance(x, str)),
             semantics=d.get("semantics") if isinstance(d.get("semantics"), dict) else {},
             pre_match=LightingState.from_dict(pre) if isinstance(pre, dict) else None,
+            notes=[str(x) for x in (d.get("notes") or []) if isinstance(x, str)],
         )
 
 

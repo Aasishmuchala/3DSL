@@ -66,6 +66,23 @@ I/O. There is no torch, no OpenCV, no required pip package.
 `python scripts/preflight.py [oc_key]` — anywhere — prints exactly what's ready; run it in
 Max's scripting listener for the pymxs/V-Ray/Vantage/rig checks too.
 
+## The conversation loop — refine with director's notes (v0.8)
+
+Watch the match live in Vantage (the link mirrors every apply), and when it isn't right,
+**tell it**: type a note — *"exposure is too much"*, *"sun should come more from the
+left"* — or tap a chip. Three things happen:
+1. a **craft table** converts common critiques into instant bounded nudges (too bright →
+   +0.7 EV; sun more left → −20° azimuth; "way too" doubles the local nudge) — effect in
+   the very next frame, no model in the loop;
+2. a **3-lens ensemble** attacks the note from independent angles — exposure-first,
+   geometry-first, mood-first agents each propose corrections; every branch is rendered
+   and scored; the winner survives;
+3. the winner continues into a **deep match** with your note pinned into every prompt as
+   the DIRECTOR'S NOTE (it outranks the reference analysis on conflict), notes accumulate
+   per camera across the session, and swapping the reference mid-conversation re-analyzes
+   automatically.
+The UI shows reference vs latest match side by side; the log is the conversation record.
+
 ## Deep match — the 99 mode (v0.7)
 
 Tick **deep match → 99** for hero shots. The precise promise, measured live:

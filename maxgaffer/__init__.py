@@ -7,4 +7,4 @@ vision LLM through the Omega gateway, judged by a deterministic tonal critic —
 Vantage live link mirrors every step in real time.
 """
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"

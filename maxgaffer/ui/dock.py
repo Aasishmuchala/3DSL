@@ -30,20 +30,29 @@ ERR = "#ff6b6b"
 OK = "#7ddba3"
 
 STYLE = (
-    f"QWidget{{background:{BG};color:#e8e8ef;font-family:Inter,'Segoe UI';font-size:12px;}}"
-    f"QPushButton{{background:{PANEL};border:1px solid #2a2a33;padding:6px 10px;border-radius:6px;}}"
-    f"QPushButton:hover{{border-color:{ACCENT};}}"
+    f"QWidget{{background:{BG};color:#eceaf4;font-family:Inter,'Segoe UI';font-size:13px;}}"
+    f"QPushButton{{background:{PANEL};border:1px solid #2b2b36;padding:9px 14px;"
+    f"border-radius:8px;}}"
+    f"QPushButton:hover{{border-color:{ACCENT};color:#ffffff;}}"
     f"QPushButton:disabled{{color:#5a5a66;border-color:#20202a;}}"
-    f"QPushButton#primary{{background:{ACCENT};color:#12121a;font-weight:600;}}"
+    f"QPushButton#primary{{background:{ACCENT};color:#12121a;font-weight:600;"
+    f"min-height:26px;letter-spacing:1px;}}"
     f"QPushButton#danger{{border-color:{ERR};color:{ERR};}}"
-    f"QLineEdit,QComboBox,QPlainTextEdit,QTreeWidget,QListWidget,QSpinBox,QDoubleSpinBox"
-    f"{{background:{PANEL};border:1px solid #2a2a33;border-radius:6px;padding:4px;}}"
-    f"QGroupBox{{border:1px solid #24242e;border-radius:8px;margin-top:12px;padding-top:14px;"
-    f"font-weight:600;letter-spacing:1px;}}"
-    f"QGroupBox::title{{color:{ACCENT};subcontrol-origin:margin;left:10px;}}"
-    f"QSlider::groove:horizontal{{height:4px;background:#24242e;border-radius:2px;}}"
-    f"QSlider::handle:horizontal{{width:12px;background:{ACCENT};margin:-5px 0;border-radius:6px;}}"
-    f"QLabel#dim{{color:#9a9aa8;}}"
+    f"QPushButton#chip{{padding:5px 10px;border-radius:12px;color:#b9b4d6;font-size:12px;}}"
+    f"QLineEdit,QComboBox,QPlainTextEdit,QTextEdit,QTreeWidget,QListWidget,QSpinBox,"
+    f"QDoubleSpinBox"
+    f"{{background:{PANEL};border:1px solid #2b2b36;border-radius:8px;padding:6px;"
+    f"selection-background-color:{ACCENT};selection-color:#12121a;}}"
+    f"QGroupBox{{border:1px solid #26262f;border-radius:12px;margin-top:18px;"
+    f"padding:16px 12px 12px 12px;font-weight:600;letter-spacing:2px;}}"
+    f"QGroupBox::title{{color:{ACCENT};subcontrol-origin:margin;left:14px;padding:0 6px;}}"
+    f"QSlider::groove:horizontal{{height:4px;background:#26262f;border-radius:2px;}}"
+    f"QSlider::handle:horizontal{{width:14px;background:{ACCENT};margin:-6px 0;"
+    f"border-radius:7px;}}"
+    f"QLabel#dim{{color:#9a97b3;}}"
+    f"QScrollBar:vertical{{background:transparent;width:10px;}}"
+    f"QScrollBar::handle:vertical{{background:#2b2b36;border-radius:5px;min-height:30px;}}"
+    f"QScrollBar::add-line,QScrollBar::sub-line{{height:0;}}"
 )
 
 
@@ -101,7 +110,8 @@ class MaxGafferDock(QtWidgets.QWidget):
     # ================================================================= layout
     def _build(self):
         root = QtWidgets.QHBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(16)
 
         # ---------------- left: camera board
         left = QtWidgets.QVBoxLayout()
@@ -141,20 +151,30 @@ class MaxGafferDock(QtWidgets.QWidget):
         right_host.setFrameShape(QtWidgets.QFrame.NoFrame)
         right_w = QtWidgets.QWidget()
         right = QtWidgets.QVBoxLayout(right_w)
+        right.setSpacing(14)
         right_host.setWidget(right_w)
         root.addWidget(right_host, 1)
 
-        # reference group
-        g_ref = QtWidgets.QGroupBox("REFERENCE")
+        # reference group — reference vs latest match, side by side
+        g_ref = QtWidgets.QGroupBox("REFERENCE  ·  LATEST MATCH")
         lr = QtWidgets.QHBoxLayout(g_ref)
-        self.ref_thumb = QtWidgets.QLabel("no reference")
-        self.ref_thumb.setFixedSize(200, 112)
-        self.ref_thumb.setAlignment(QtCore.Qt.AlignCenter)
-        self.ref_thumb.setStyleSheet(f"background:{PANEL};border:1px dashed #2a2a33;"
-                                     "border-radius:6px;color:#5a5a66;")
+        lr.setSpacing(14)
+
+        def _thumb(placeholder):
+            t = QtWidgets.QLabel(placeholder)
+            t.setFixedSize(272, 153)
+            t.setAlignment(QtCore.Qt.AlignCenter)
+            t.setStyleSheet(f"background:{PANEL};border:1px dashed #2b2b36;"
+                            "border-radius:10px;color:#5a5a66;")
+            return t
+
+        self.ref_thumb = _thumb("no reference")
         lr.addWidget(self.ref_thumb)
+        self.match_thumb = _thumb("no match yet")
+        lr.addWidget(self.match_thumb)
         ref_col = QtWidgets.QVBoxLayout()
-        btn_ref = QtWidgets.QPushButton("Load reference…")
+        ref_col.setSpacing(10)
+        btn_ref = QtWidgets.QPushButton("Load / swap reference…")
         btn_ref.clicked.connect(self._pick_reference)
         ref_col.addWidget(btn_ref)
         self.lbl_ref_info = QtWidgets.QLabel("")
@@ -260,6 +280,40 @@ class MaxGafferDock(QtWidgets.QWidget):
         lrow.addStretch(1)
         lm.addLayout(lrow)
         right.addWidget(g_match)
+
+        # refine group — talk to the gaffer
+        g_ref2 = QtWidgets.QGroupBox("REFINE — TELL THE GAFFER")
+        lref = QtWidgets.QVBoxLayout(g_ref2)
+        lref.setSpacing(10)
+        self.ed_note = QtWidgets.QLineEdit()
+        self.ed_note.setPlaceholderText(
+            "e.g. \"exposure is too much\" · \"sun should come more from the left\" · "
+            "\"too warm, shadows too soft\"")
+        self.ed_note.returnPressed.connect(self._start_refine)
+        lref.addWidget(self.ed_note)
+        chips = QtWidgets.QHBoxLayout()
+        chips.setSpacing(6)
+        for label in ("too bright", "too dark", "too warm", "too cool",
+                      "harder shadows", "softer shadows", "sun more left",
+                      "sun more right"):
+            b = QtWidgets.QPushButton(label)
+            b.setObjectName("chip")
+            b.clicked.connect(lambda _c=False, t=label: self._chip_note(t))
+            chips.addWidget(b)
+        chips.addStretch(1)
+        lref.addLayout(chips)
+        rrow = QtWidgets.QHBoxLayout()
+        self.btn_refine = QtWidgets.QPushButton("REFINE  ·  3-LENS ENSEMBLE")
+        self.btn_refine.setObjectName("primary")
+        self.btn_refine.setToolTip(
+            "Your note takes instant effect via the craft table, then three agent lenses "
+            "(exposure-first / geometry-first / mood-first) propose competing corrections — "
+            "every branch is rendered and scored, the winner continues into a deep match "
+            "with your note pinned into every prompt.")
+        self.btn_refine.clicked.connect(self._start_refine)
+        rrow.addWidget(self.btn_refine, 1)
+        lref.addLayout(rrow)
+        right.addWidget(g_ref2)
 
         # rig group (sliders built dynamically from the scene)
         g_rig = QtWidgets.QGroupBox("RIG — live controls")
@@ -583,6 +637,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             ceiling = (" · ceiling proven — the gap left is content, not lighting"
                        if result.ceiling_converged and (result.best_score or 0) < 99 else "")
             self._log(f"✓ done ({result.stop_reason}) — best {score}{ceiling}")
+            self._set_match_thumb(result.best_render)
             if self.cfg.show_report_popup:
                 ChangeReportDialog(plan_report,
                                    self.ctrl.state_change_rows(cam),
@@ -649,6 +704,67 @@ class MaxGafferDock(QtWidgets.QWidget):
     def _cancel_match(self):
         self._cancel = True
         self._log("cancelling after the current step…")
+
+    def _chip_note(self, text: str):
+        cur = self.ed_note.text().strip()
+        self.ed_note.setText((cur + ", " + text) if cur else text)
+
+    def _set_match_thumb(self, path):
+        if path and os.path.exists(path):
+            pix = QtGui.QPixmap(path)
+            if not pix.isNull():
+                self.match_thumb.setPixmap(pix.scaled(
+                    self.match_thumb.size(), QtCore.Qt.KeepAspectRatio,
+                    QtCore.Qt.SmoothTransformation))
+                return
+        self.match_thumb.setPixmap(QtGui.QPixmap())
+        self.match_thumb.setText("no match yet")
+
+    def _start_refine(self):
+        if self._busy:
+            return
+        cam = self._current_camera()
+        note = self.ed_note.text().strip()
+        if not cam or not note:
+            self._log("select a camera and type a note first")
+            return
+        e = self.ctrl.session.cameras.get(cam)
+        if not (e and e.reference):
+            self._log("bind a reference image first")
+            return
+        self._busy = True
+        self._cancel = False
+        self.btn_match.setEnabled(False)
+        self.btn_match_all.setEnabled(False)
+        self.btn_refine.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self._log(f"— refine: {cam} — “{note}”")
+        try:
+            result = self.ctrl.refine(cam, note, log=self._log,
+                                      should_cancel=lambda: self._cancel)
+            score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
+            ceiling = (" · ceiling proven — the gap left is content, not lighting"
+                       if result.ceiling_converged and (result.best_score or 0) < 99 else "")
+            self._log(f"✓ refine done ({result.stop_reason}) — best {score}{ceiling}")
+            self._set_match_thumb(result.best_render)
+            self.ed_note.clear()
+            if self.cfg.show_report_popup:
+                ChangeReportDialog(None, self.ctrl.state_change_rows(cam),
+                                   f"{cam} — refined to {score}", self).exec()
+        except (OmegaError, RuntimeError) as err:
+            self._log(f"✗ {err}")
+        except Exception as err:  # noqa: BLE001
+            self._log(f"✗ unexpected: {err}")
+        finally:
+            self._busy = False
+            self._ab_on_pre = False
+            self.btn_match.setEnabled(True)
+            self.btn_match_all.setEnabled(True)
+            self.btn_refine.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
+            self.refresh_cameras()
+            self.rebuild_rig_controls()
+            self._show_reference(cam)
 
     def _open_run_dir(self):
         d = self.ctrl._run_dir or cfgmod.sessions_dir()
@@ -938,11 +1054,11 @@ def show_dock():
         dock.setWidget(widget)
         parent.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
         dock.setFloating(True)
-        dock.resize(760, 900)
+        dock.resize(940, 1080)
         dock.show()
         _dock_instance = widget
     else:  # dev fallback: plain window
         _dock_instance = MaxGafferDock()
-        _dock_instance.resize(760, 900)
+        _dock_instance.resize(940, 1080)
         _dock_instance.show()
     return _dock_instance

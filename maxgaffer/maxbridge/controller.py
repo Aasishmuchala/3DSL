@@ -20,7 +20,7 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..core import consensus, critic, metrics, omega, planner, prompts, rules, scenedigest
+from ..core import consensus, critic, feedback, metrics, omega, planner, prompts, rules, scenedigest
 from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
@@ -263,7 +263,8 @@ class Controller:
             content.append(omega.text_block(prompts.deltas_user_text(
                 ctx["state_table"], ctx["semantics"], ctx["score_history"],
                 ctx["analytic_applied"], ctx["iteration"], ctx["max_iterations"],
-                ctx.get("rig_notes", ""), ctx.get("param_history", ""))))
+                ctx.get("rig_notes", ""), ctx.get("param_history", ""),
+                ctx.get("director_note", ""))))
             return self.io(lambda: omega.call(
                 self.cfg.api_key, prompts.DELTAS_SYSTEM,
                 [{"role": "user", "content": content}],
@@ -376,6 +377,8 @@ class Controller:
         locks: Optional[set] = None,
         do_sweep: bool = False,
         deep: bool = False,
+        start_override: Optional[LightingState] = None,
+        director_note: str = "",
     ) -> MatchResult:
         e = self.session.entry(camera_name)
         if not e.reference:
@@ -421,11 +424,16 @@ class Controller:
         if ref_block is None:
             raise RuntimeError("reference image could not be prepared for the LLM")
 
-        current = ap.read_state(rig, self._baselines, cam)
-        start, why = rules.initial_state(semantics, current, sc.camera_yaw_deg(cam), locks,
-                                         overcast_sun_mode=self.cfg.overcast_sun_mode)
-        for line in why:
-            log("first guess: " + line)
+        if start_override is not None:
+            start = start_override.copy()
+            log("refine: starting from the ensemble winner (first-guess skipped)")
+        else:
+            current = ap.read_state(rig, self._baselines, cam)
+            start, why = rules.initial_state(semantics, current, sc.camera_yaw_deg(cam),
+                                             locks,
+                                             overcast_sun_mode=self.cfg.overcast_sun_mode)
+            for line in why:
+                log("first guess: " + line)
 
         draft_applied = False
         if self.cfg.draft_sampler:
@@ -455,7 +463,8 @@ class Controller:
                 "used; consider a cleaner reference if the match fights you")
             self._last_analyze_agreement = None
 
-        if do_sweep and rig.get("sun") is not None and "sun.azimuth_deg" not in locks:
+        if do_sweep and start_override is None and rig.get("sun") is not None \
+                and "sun.azimuth_deg" not in locks:
             log(f"sun sweep: {self.cfg.sweep_count} directions…")
             az, alt_hint, _why = run_sun_sweep(
                 start, rules.sweep_azimuths(self.cfg.sweep_count), hooks,
@@ -485,7 +494,8 @@ class Controller:
                 "coordinate-descent polish to the scene's ceiling afterwards")
         try:
             result = run_match(start, ref_stats, semantics, hooks, cfg, locks,
-                               rig_notes="; ".join(rig.get("notes", [])))
+                               rig_notes="; ".join(rig.get("notes", [])),
+                               director_note=director_note)
         finally:
             if draft_applied:   # crash-safe: even a raise puts the artist's sampler back
                 for line in df.restore_draft():
@@ -501,6 +511,96 @@ class Controller:
                 + (" · CEILING PROVEN (no fine move improves)"
                    if result.ceiling_converged else ""))
         return result
+
+    def refine(
+        self,
+        camera_name: str,
+        note: str,
+        log: Callable[[str], None],
+        should_cancel: Callable[[], bool] = lambda: False,
+    ) -> MatchResult:
+        """The conversation turn: a director's note → instant deterministic nudges →
+        3-lens ENSEMBLE (competing corrections, each branch rendered and scored) → the
+        winner continues into a deep match with the note pinned into every prompt."""
+        e = self.session.entry(camera_name)
+        if not e.reference:
+            raise RuntimeError("bind a reference image to this camera first")
+        e.notes = (getattr(e, "notes", []) + [note])[-6:]
+        combined = " · ".join(e.notes[-3:])
+        rig = self.rig(refresh=True)
+        cam = sc.get_camera(camera_name)
+        if cam is None:
+            raise RuntimeError(f"camera '{camera_name}' not found")
+        sc.set_active_camera(camera_name)
+        run_dir = self._new_run_dir(camera_name)
+        semantics = self.analyze_reference(camera_name)   # re-analyzes if ref was swapped
+        ref_stats = self.ref_stats(e.reference)
+        ref_block = self._image_block(e.reference)
+        if ref_block is None:
+            raise RuntimeError("reference image could not be prepared for the LLM")
+
+        base = (e.state.copy() if e.state is not None
+                else ap.read_state(rig, self._baselines, cam))
+        deltas = feedback.nudges_from_note(note, base.keys(), list(base.groups))
+        state0, applied = feedback.apply_note_deltas(base, deltas)
+        for k, v in applied.items():
+            log(f"note → {k} = {v:.2f} (instant)")
+
+        def probe(st: LightingState, tag: str):
+            self._apply_logged(rig, st, cam, log)
+            path = rd.render_frame(cam, os.path.join(run_dir, f"{tag}.png"),
+                                   self.cfg.loop_width, self.cfg.loop_height)
+            stats = self.stats_for(path) if path else None
+            if stats is None or ref_stats is None:
+                return None, path
+            return critic.score(ref_stats, stats,
+                                self.cfg.critic_weights or None).score, path
+
+        score0, path0 = probe(state0, "refine_note")
+        log(f"branch note-only: {score0:.1f}" if score0 is not None
+            else "branch note-only: unscored")
+        branches = [("note-only", state0, score0)]
+        render0_block = self._image_block(path0) if path0 else None
+        from ..core.genome import apply_changes, state_table
+        from ..core.parse import validate_deltas
+
+        for lens_name, lens_line in feedback.LENSES:
+            if should_cancel():
+                break
+            content = [ref_block]
+            if render0_block is not None:
+                content.append(render0_block)
+            content.append(omega.text_block(prompts.deltas_user_text(
+                state_table(state0, e.locks), semantics, [], {}, 0, 1,
+                "; ".join(rig.get("notes", [])), "", combined)))
+            try:
+                reply = self.io(lambda: omega.call(
+                    self.cfg.api_key,
+                    feedback.lens_system(prompts.DELTAS_SYSTEM, lens_line),
+                    [{"role": "user", "content": content}],
+                    model=self.cfg.model, max_tokens=2048))
+                proposal = validate_deltas(reply)
+            except Exception as err:  # noqa: BLE001 a dead lens must not kill the round
+                log(f"lens {lens_name}: unusable ({err})")
+                continue
+            cand, accepted, _rej = apply_changes(state0, proposal["changes"], e.locks,
+                                                 limit=True)
+            if not accepted:
+                log(f"lens {lens_name}: no valid changes")
+                continue
+            sc_val, _p = probe(cand, f"refine_{lens_name}")
+            log(f"branch {lens_name}: "
+                + (f"{sc_val:.1f}" if sc_val is not None else "unscored")
+                + " · " + ", ".join(f"{k}→{v:.2f}" for k, v in accepted.items()))
+            branches.append((lens_name, cand, sc_val))
+
+        scored = [b for b in branches if b[2] is not None]
+        winner = (max(scored, key=lambda b: b[2]) if scored else branches[0])
+        log(f"ensemble winner: {winner[0]}"
+            + (f" at {winner[2]:.1f}" if winner[2] is not None else ""))
+        return self.run_match(camera_name, log, should_cancel, locks=set(e.locks),
+                              do_sweep=False, deep=True, start_override=winner[1],
+                              director_note=combined)
 
     def match_all(
         self,

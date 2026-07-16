@@ -76,8 +76,12 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
     s_hue = max(0.0, cosine(ref.get("hue_hist", []), cur.get("hue_hist", [])))
 
     comps = {"key": s_key, "envelope": s_env, "histogram": s_hist, "color": s_col, "hue": s_hue}
-    g_ref, g_cur = ref.get("grid"), cur.get("grid")
-    if g_ref and g_cur and any(abs(v) > 1e-6 for v in g_ref):
+    # prefer the finer 5×5 grid when both sides carry it (better azimuth acuity);
+    # 3×3 remains for stats produced by older engine versions
+    g_ref, g_cur = ref.get("grid5"), cur.get("grid5")
+    if not (g_ref and g_cur and len(g_ref) == len(g_cur or [])):
+        g_ref, g_cur = ref.get("grid"), cur.get("grid")
+    if g_ref and g_cur and len(g_ref) == len(g_cur) and any(abs(v) > 1e-6 for v in g_ref):
         comps["direction"] = max(0.0, (cosine(g_ref, g_cur) + 1.0) / 2.0)
     # only weigh what was measurable — old stats without a grid renormalize cleanly
     total_w = sum(w[k] for k in comps) or 1.0

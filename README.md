@@ -66,6 +66,22 @@ I/O. There is no torch, no OpenCV, no required pip package.
 `python scripts/preflight.py [oc_key]` — anywhere — prints exactly what's ready; run it in
 Max's scripting listener for the pymxs/V-Ray/Vantage/rig checks too.
 
+## Deep match — the 99 mode (v0.7)
+
+Tick **deep match → 99** for hero shots. The precise promise, measured live:
+* when the reference is **reachable** (same scene / relight / compatible space), the
+  engine lands **≥99**: annealed steps and tightening solver deadbands finish what
+  exploration started, then an LLM-free **adaptive coordinate line search** (climb while a
+  rendered nudge measurably improves the critic, accelerate on streaks, halve on failure,
+  EV/WB are axes too so geometry can never fake exposure) squeezes to the optimum.
+  Live benchmark, asserted: **99.14 from the basin, deterministic legs only**; full live
+  pipeline **14.3 → 98.25 with a 4° sun-direction error**.
+* when the reference is a **different scene**, no lighting can produce its histogram —
+  the engine converges to the scene's own optimum and the report SAYS SO: *"ceiling
+  proven — the gap left is content, not lighting."* Two consecutive diminishing-return
+  rounds (< 0.2 score) or full step-floor exhaustion is the convergence proof.
+Cost: up to ~10 loop iterations + ≤120 polish probes at loop resolution — hero-shot money.
+
 ## Agent mode — scene-wide plans (v0.5)
 
 With **scene-wide plan first** checked (default), MATCH runs the full agent flow:

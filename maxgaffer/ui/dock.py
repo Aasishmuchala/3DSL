@@ -199,6 +199,13 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.spin_target.setRange(50.0, 100.0)
         self.spin_target.setValue(float(self.cfg.target_score))
         opts.addWidget(self.spin_target)
+        self.chk_deep = QtWidgets.QCheckBox("deep match → 99")
+        self.chk_deep.setToolTip(
+            "Hero-shot mode: up to 10 iterations targeting 99, then an LLM-free "
+            "coordinate-descent polish that keeps rendering fine nudges until no move "
+            "improves the score — a proven optimum. If 99 isn't reachable, the report says "
+            "the remaining gap is content, not lighting. Costs ~20-40 extra loop renders.")
+        opts.addWidget(self.chk_deep)
         self.chk_draft = QtWidgets.QCheckBox("draft sampler")
         self.chk_draft.setChecked(bool(self.cfg.draft_sampler))
         self.chk_draft.setToolTip(
@@ -570,9 +577,12 @@ class MaxGafferDock(QtWidgets.QWidget):
                 cam, log=self._log,
                 should_cancel=lambda: self._cancel,
                 locks=self._locks(),
-                do_sweep=self.chk_sweep.isChecked())
+                do_sweep=self.chk_sweep.isChecked(),
+                deep=self.chk_deep.isChecked())
             score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
-            self._log(f"✓ done ({result.stop_reason}) — best {score}")
+            ceiling = (" · ceiling proven — the gap left is content, not lighting"
+                       if result.ceiling_converged and (result.best_score or 0) < 99 else "")
+            self._log(f"✓ done ({result.stop_reason}) — best {score}{ceiling}")
             if self.cfg.show_report_popup:
                 ChangeReportDialog(plan_report,
                                    self.ctrl.state_change_rows(cam),

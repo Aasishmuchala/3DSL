@@ -375,6 +375,7 @@ class Controller:
         should_cancel: Callable[[], bool] = lambda: False,
         locks: Optional[set] = None,
         do_sweep: bool = False,
+        deep: bool = False,
     ) -> MatchResult:
         e = self.session.entry(camera_name)
         if not e.reference:
@@ -472,11 +473,16 @@ class Controller:
                         f"{start.get('sun.altitude_deg'):.0f}° ('{alt_hint}')")
 
         cfg = MatchConfig(
-            max_iterations=int(self.cfg.max_iterations),
-            target_score=float(self.cfg.target_score),
+            max_iterations=(max(int(self.cfg.max_iterations), 10) if deep
+                            else int(self.cfg.max_iterations)),
+            target_score=99.0 if deep else float(self.cfg.target_score),
             analytic=ref_stats is not None,
             weights=self.cfg.critic_weights or None,
+            polish=deep,
         )
+        if deep:
+            log(f"DEEP MATCH: target 99 · up to {cfg.max_iterations} iterations · "
+                "coordinate-descent polish to the scene's ceiling afterwards")
         try:
             result = run_match(start, ref_stats, semantics, hooks, cfg, locks,
                                rig_notes="; ".join(rig.get("notes", [])))
@@ -490,6 +496,10 @@ class Controller:
         score_txt = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
         log(f"match finished: {result.stop_reason}, best score {score_txt} "
             f"({len(result.iterations)} iterations)")
+        if result.polish_probes:
+            log(f"polish: +{result.polish_gain:.2f} over {result.polish_probes} probes"
+                + (" · CEILING PROVEN (no fine move improves)"
+                   if result.ceiling_converged else ""))
         return result
 
     def match_all(

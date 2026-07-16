@@ -3,7 +3,7 @@
 **Owner:** Aasish Muchala · **Type:** internal Sthyra pipeline tool (not sold) ·
 **Target:** 3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x ·
 **Sibling of:** MaxDirector (same Omega gateway, same hexagon, key borrowed automatically) ·
-**Status:** v0.6.1 QUALITY-HARDENED 2026-07-16 · 107 tests · live benchmark: Phase A 99.0 asserted, Phase B 90.0 target_reached (full live pipeline) · stack doc-verified ·
+**Status:** v0.7.0 DEEP-MATCH 2026-07-16 · 114 tests · live benchmark: Phase C 99.14 ASSERTED (deterministic legs from basin) · Phase B full live pipeline 98.25, az error 4° · stack doc-verified ·
 awaiting on-box bring-up (tasks/plan.md P0).
 
 ## 1. Summary
@@ -18,6 +18,7 @@ matched cameras through vantage_console" is one button.
 
 | Decision | Choice |
 |---|---|
+| Deep match | annealed steps/deadbands + LLM-free adaptive coordinate line search (EV/WB axes included — anti-compensation-drift) to ≥99 when reachable, else a PROVEN ceiling (2 diminishing-return rounds or step-floor exhaustion) reported as content-gap |
 | Split of powers | **math owns EV/WB** (histogram solver, highlight-quartile WB) · **LLM owns semantics** (3-sample ANALYZE consensus; ≤4 bounded changes/iter, trajectory-aware) · **sweep owns coarse sun azimuth** (LLM multiple-choice × direction-metric cross-check) · **critic owns accept/revert** (incl. direction component) · **human owns taste** (locks, sliders, restore, plan preview + measured plan effect) |
 | Genome as gate | every proposal validated: unknown → dropped, locked → refused, bounds → clamped, per-iter steps → limited; 180° wrap resolves clockwise (deterministic antipode) |
 | Trust model | **snapshot-first**: pre-match state auto-saved per camera + Restore button · one undo record per apply · matches are explorations, never commitments |

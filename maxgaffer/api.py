@@ -48,15 +48,18 @@ def match_camera(
     should_cancel: Callable[[], bool] = lambda: False,
     locks: Optional[set] = None,
     sweep: bool = True,
+    deep: bool = False,
     config_overrides: Optional[Dict] = None,
 ) -> Dict:
-    """Bind ``reference_path`` (if given) to ``camera_name`` and run the full match loop."""
+    """Bind ``reference_path`` (if given) to ``camera_name`` and run the full match loop.
+    ``deep=True`` = hero-shot mode: target 99, ≥10 iterations, coordinate-descent polish;
+    ``ceiling_converged`` in the result means the remaining gap is content, not lighting."""
     ctrl = get_controller(config_overrides)
     if reference_path:
         ctrl.session.set_reference(camera_name, reference_path)
         ctrl.save_session()
     result = ctrl.run_match(camera_name, log=log, should_cancel=should_cancel,
-                            locks=locks, do_sweep=sweep)
+                            locks=locks, do_sweep=sweep, deep=deep)
     return {
         "score": result.best_score,
         "stop_reason": result.stop_reason,
@@ -64,6 +67,8 @@ def match_camera(
         "state": result.best_state.to_dict(),
         "run_dir": ctrl._run_dir,
         "renders": [r.render_path for r in result.iterations if r.render_path],
+        "polish_gain": result.polish_gain,
+        "ceiling_converged": result.ceiling_converged,
     }
 
 

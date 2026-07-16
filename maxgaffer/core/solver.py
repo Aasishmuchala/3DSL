@@ -32,19 +32,25 @@ WB_KELVIN_PER_B = 90.0
 WB_MAX_STEP = 1500.0
 
 
-def solve_ev(ref_stats: Dict, cur_stats: Dict, current_ev: float) -> Optional[float]:
-    """New EV that matches the render's key to the reference's, or None if close enough."""
+def solve_ev(ref_stats: Dict, cur_stats: Dict, current_ev: float,
+             tighten: float = 1.0) -> Optional[float]:
+    """New EV that matches the render's key to the reference's, or None if close enough.
+    ``tighten`` < 1 shrinks the deadband (and the per-step cap) as the match converges —
+    a 0.15-stop tolerance is exploration slack, not a finishing standard."""
     key_ref = max(1e-5, float(ref_stats.get("log_key", 0.0)))
     key_cur = max(1e-5, float(cur_stats.get("log_key", 0.0)))
     d_ev = math.log2(key_ref / key_cur)
-    if abs(d_ev) < EV_DEADBAND:
+    if abs(d_ev) < EV_DEADBAND * max(0.1, tighten):
         return None
+    # NOTE: only the DEADBAND anneals — the correction cap stays full-size, because a
+    # measured 2-stop error deserves a 2-stop fix regardless of how well the rest of the
+    # match is going (the cap is a stability rail, not a convergence knob)
     d_ev = max(-EV_MAX_STEP, min(EV_MAX_STEP, d_ev))
     return clamp("exposure.ev", current_ev - d_ev)
 
 
 def solve_wb(ref_stats: Dict, cur_stats: Dict, current_kelvin: float,
-             kelvin_per_b: float = WB_KELVIN_PER_B) -> Optional[float]:
+             kelvin_per_b: float = WB_KELVIN_PER_B, tighten: float = 1.0) -> Optional[float]:
     """New WB kelvin nudging the render's blue-yellow balance toward the reference.
 
     Prefers HIGHLIGHT chromaticity (top luminance quartile — the white-patch assumption:
@@ -63,7 +69,7 @@ def solve_wb(ref_stats: Dict, cur_stats: Dict, current_kelvin: float,
         b_ref = float(ref_stats.get("lab_mean", [0, 0, 0])[2])
         b_cur = float(cur_stats.get("lab_mean", [0, 0, 0])[2])
     db = b_ref - b_cur
-    if abs(db) < WB_DEADBAND_B:
+    if abs(db) < WB_DEADBAND_B * max(0.1, tighten):
         return None
     delta = max(-WB_MAX_STEP, min(WB_MAX_STEP, db * kelvin_per_b))
     return clamp("exposure.wb_kelvin", current_kelvin + delta)
@@ -74,6 +80,7 @@ def analytic_pass(
     ref_stats: Dict,
     cur_stats: Dict,
     locks: Optional[set] = None,
+    tighten: float = 1.0,
 ) -> Dict[str, float]:
     """The changes the solver wants this iteration ({} when everything is in the deadband).
 
@@ -84,11 +91,12 @@ def analytic_pass(
     locks = locks or set()
     changes: Dict[str, float] = {}
     if "exposure.ev" in state.values and "exposure.ev" not in locks:
-        ev = solve_ev(ref_stats, cur_stats, state.get("exposure.ev"))
+        ev = solve_ev(ref_stats, cur_stats, state.get("exposure.ev"), tighten)
         if ev is not None:
             changes["exposure.ev"] = ev
     if "exposure.wb_kelvin" in state.values and "exposure.wb_kelvin" not in locks:
-        wb = solve_wb(ref_stats, cur_stats, state.get("exposure.wb_kelvin"))
+        wb = solve_wb(ref_stats, cur_stats, state.get("exposure.wb_kelvin"),
+                      tighten=tighten)
         if wb is not None:
             changes["exposure.wb_kelvin"] = wb
     return changes

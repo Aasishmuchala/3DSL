@@ -87,24 +87,29 @@ def clamp(key: str, value: float) -> float:
     return min(spec.hi, max(spec.lo, v))
 
 
-def limit_step(key: str, current: float, proposed: float) -> float:
+def limit_step(key: str, current: float, proposed: float, scale: float = 1.0) -> float:
     """Clamp ``proposed`` so one iteration never moves further than the spec's step.
-    Log-scale params limit the log2 ratio; wrapped params take the short way around."""
+    Log-scale params limit the log2 ratio; wrapped params take the short way around.
+
+    ``scale`` anneals the step budget: 1.0 while exploring, shrinking as the match closes
+    in — a 60° azimuth swing is how you FIND the sun, not how you land the last two points.
+    """
     spec = spec_for(key)
     if spec is None:
         raise KeyError(f"unknown lighting parameter: {key}")
+    step = spec.step * max(0.05, float(scale))
     cur, prop = float(current), float(proposed)
     if spec.wrap:
         delta = (prop - cur + 180.0) % 360.0 - 180.0
         if delta == -180.0:   # antipode is ambiguous — deterministically go clockwise
             delta = 180.0
-        delta = max(-spec.step, min(spec.step, delta))
+        delta = max(-step, min(step, delta))
         return _wrap_deg(cur + delta)
     if spec.log_scale and cur > 1e-6 and prop > 1e-6:
         ratio = math.log2(prop / cur)
-        ratio = max(-spec.step, min(spec.step, ratio))
+        ratio = max(-step, min(step, ratio))
         return clamp(key, cur * (2.0 ** ratio))
-    delta = max(-spec.step, min(spec.step, prop - cur))
+    delta = max(-step, min(step, prop - cur))
     return clamp(key, cur + delta)
 
 
@@ -165,9 +170,11 @@ def apply_changes(
     changes: Dict[str, float],
     locks: Optional[set] = None,
     limit: bool = True,
+    step_scale: float = 1.0,
 ) -> Tuple[LightingState, Dict[str, float], List[str]]:
     """Validated apply: returns (new_state, accepted{key: value}, rejected[reason...]).
-    Unknown keys are dropped, locked keys refused, bounds clamped, steps limited."""
+    Unknown keys are dropped, locked keys refused, bounds clamped, steps limited
+    (``step_scale`` anneals the per-iteration budget)."""
     locks = locks or set()
     new = state.copy()
     accepted: Dict[str, float] = {}
@@ -186,7 +193,7 @@ def apply_changes(
             rejected.append(f"{key}: non-numeric value {raw!r}")
             continue
         if limit:
-            value = limit_step(key, new.get(key, spec.lo), value)
+            value = limit_step(key, new.get(key, spec.lo), value, step_scale)
         else:
             value = clamp(key, value)
         new.set(key, value)

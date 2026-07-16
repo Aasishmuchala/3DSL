@@ -74,7 +74,8 @@ def test_api_imports_and_exposes_contract():
                                 "get_controller"}
     sig = inspect.signature(api.match_camera)
     assert list(sig.parameters) == ["camera_name", "reference_path", "log",
-                                    "should_cancel", "locks", "sweep", "config_overrides"]
+                                    "should_cancel", "locks", "sweep", "deep",
+                                    "config_overrides"]
 
 
 # --------------------------------------------------------------- config completeness

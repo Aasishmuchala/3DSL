@@ -100,6 +100,8 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     # camera-left brightens the left cells of ref AND render) — the critic's direction eye.
     grid_sum = [0.0] * 9
     grid_n = [0] * 9
+    g5_sum = [0.0] * 25
+    g5_n = [0] * 25
     for idx, (r, g, b) in enumerate(pixels):
         mean_rgb[0] += r
         mean_rgb[1] += g
@@ -118,6 +120,9 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         cell = min(2, x * 3 // max(1, w)) + 3 * min(2, y * 3 // max(1, h))
         grid_sum[cell] += lum
         grid_n[cell] += 1
+        c5 = min(4, x * 5 // max(1, w)) + 5 * min(4, y * 5 // max(1, h))
+        g5_sum[c5] += lum
+        g5_n[c5] += 1
         L, a, bb = _rgb_to_lab(r, g, b)
         for i, v in enumerate((L, a, bb)):
             lab_sum[i] += v
@@ -153,10 +158,13 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     key_center = log_sum_center / n_center if n_center else key_full
     grid_mean = sum(grid_sum) / max(1, sum(grid_n)) or 1e-6
     grid = [(grid_sum[i] / grid_n[i] - grid_mean) if grid_n[i] else 0.0 for i in range(9)]
+    g5_mean = sum(g5_sum) / max(1, sum(g5_n)) or 1e-6
+    grid5 = [(g5_sum[i] / g5_n[i] - g5_mean) if g5_n[i] else 0.0 for i in range(25)]
     return {
         "count": n,
         "mean_rgb": [v / n / 255.0 for v in mean_rgb],
         "grid": [round(g, 5) for g in grid],   # mean-centered 3×3 luminance pattern
+        "grid5": [round(g, 5) for g in grid5],  # 5×5 — finer directional acuity
         "lab_mean_hi": ([s / hi_n for s in hi_sum] if hi_n else lab_mean),
         # geometric mean of LINEAR luminance, 60% center-weighted (blend in log space)
         "log_key": math.exp(0.6 * key_center + 0.4 * key_full),

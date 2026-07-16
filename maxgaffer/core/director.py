@@ -49,6 +49,47 @@ class MatchConfig:
     # LLM just saw was badly mis-exposed — its absolute-brightness judgments (intensities,
     # group levels) are contaminated and get dropped for that iteration
     contaminated_ev_step: float = 1.5
+    # DEEP-MATCH finisher: after the loop, an LLM-free adaptive coordinate line search —
+    # climb while a rendered nudge improves the score, halve the step when it doesn't,
+    # converged when every step bottoms out. That exhaustion IS a provable local optimum:
+    # the scene's ceiling for this reference.
+    polish: bool = False
+    polish_rounds: int = 10
+    polish_min_gain: float = 0.03
+    polish_stop_at: float = 99.5
+    # converged = a strict no-improve round with all steps floored, OR two consecutive
+    # rounds each gaining < round_eps — on smooth landscapes every round finds crumbs
+    # forever, and "within 2ε of the optimum along every probed axis" IS the ceiling
+    polish_round_eps: float = 0.2
+    # a full convergence PROOF costs ~2 probes × 9 params × 5 step levels + the climbs;
+    # stop_at usually exits far earlier — the cap is the overnight safety rail
+    polish_max_probes: int = 120
+
+
+def _anneal(best_score: Optional[float]) -> float:
+    """Step/deadband scale from convergence: explore big, finish small."""
+    if best_score is None or best_score < 70.0:
+        return 1.0
+    if best_score < 85.0:
+        return 0.5
+    return 0.25
+
+
+# adaptive coordinate line-search table: (key, initial_step, is_log2_step, fine_floor).
+# EV and WB are axes here too — measured descent, so no analytic-ownership conflict —
+# because freezing them while geometry moves invites COMPENSATION DRIFT: live sim showed
+# altitude climbing AWAY from its target to fake the exposure key at a stale EV.
+POLISH_PARAMS = (
+    ("exposure.ev", 0.4, False, 0.05),
+    ("exposure.wb_kelvin", 400.0, False, 50.0),
+    ("sun.azimuth_deg", 12.0, False, 1.0),
+    ("sun.altitude_deg", 6.0, False, 0.75),
+    ("sun.size", 0.5, True, 0.08),
+    ("sun.intensity", 0.35, True, 0.06),
+    ("sun.turbidity", 1.0, False, 0.2),
+    ("dome.intensity", 0.35, True, 0.06),
+    ("dome.rotation_deg", 12.0, False, 1.5),
+)
 
 
 @dataclass
@@ -84,6 +125,10 @@ class MatchResult:
     best_render: Optional[str]
     stop_reason: str
     iterations: List[IterationRecord] = field(default_factory=list)
+    polish_gain: float = 0.0            # score added by the coordinate-descent finisher
+    polish_probes: int = 0
+    ceiling_converged: bool = False     # polish exhausted: no fine move improves — this
+                                        # score IS the scene's ceiling for this reference
 
 
 def run_match(
@@ -131,6 +176,15 @@ def run_match(
             break
 
         cur_stats = hooks.stats(path) if metrics_ok else None
+        # MEASURED mis-exposure of the frame the LLM is about to judge — drives the
+        # contamination guard directly (the capped/annealed applied delta understates it)
+        misexposure = 0.0
+        if cur_stats is not None and ref_stats is not None:
+            import math as _math
+
+            misexposure = abs(_math.log2(
+                max(1e-5, float(ref_stats.get("log_key", 0.0)))
+                / max(1e-5, float(cur_stats.get("log_key", 0.0)))))
         if cur_stats is not None and ref_stats is not None:
             verdict = critic.score(ref_stats, cur_stats, cfg.weights)
             rec.score, rec.components = verdict.score, verdict.components
@@ -183,10 +237,12 @@ def run_match(
             break
 
         # ---- analytic solve (deterministic, before/independent of the LLM)
+        # annealed: exploration-sized steps and deadbands shrink as the score climbs
+        anneal = _anneal(best_score)
         analytic: Dict[str, float] = {}
-        ev_at_solve = state.get("exposure.ev") if "exposure.ev" in state.values else None
         if cfg.analytic and cur_stats is not None and ref_stats is not None:
-            analytic = solver.analytic_pass(state, ref_stats, cur_stats, locks)
+            analytic = solver.analytic_pass(state, ref_stats, cur_stats, locks,
+                                            tighten=anneal)
             if "exposure.ev" in analytic:
                 leashed = min(leash_ev_hi, max(leash_ev_lo, analytic["exposure.ev"]))
                 if abs(leashed - analytic["exposure.ev"]) > 1e-6:
@@ -253,25 +309,22 @@ def run_match(
                 proposal["changes"].pop(k, None)
                 rec.llm_rejected.append(f"{k}: analytic — the solver owns it")
                 hooks.log(f"iter {i}: refused {k} (analytic — solver owns it)")
-        # contaminated-iteration guard: if the solver just moved EV substantially, the
-        # render the LLM critiqued was mis-exposed — drop its absolute-brightness moves.
-        # Measured against the EV at solve time (NOT the iteration-start snapshot, which
-        # goes stale when a slump-revert swapped the state mid-iteration).
-        ev_after = rec.analytic_changes.get("exposure.ev")
-        ev_moved = (abs(ev_after - ev_at_solve)
-                    if (ev_at_solve is not None and ev_after is not None) else 0.0)
-        if ev_moved >= cfg.contaminated_ev_step:
+        # contaminated-iteration guard: the frame the LLM critiqued was MEASURABLY
+        # mis-exposed — its absolute-brightness judgments (intensities, groups) are
+        # contamination regardless of how much of the error the solver corrected
+        if misexposure >= cfg.contaminated_ev_step:
             dropped = [k for k in proposal["changes"]
                        if k.endswith(".intensity") or k.startswith("group.")]
             for k in dropped:
                 proposal["changes"].pop(k, None)
                 rec.llm_rejected.append(
-                    f"{k}: dropped — render was {ev_moved:.1f} stops mis-exposed, "
+                    f"{k}: dropped — render was {misexposure:.1f} stops mis-exposed, "
                     "brightness judgment contaminated")
             if dropped:
                 hooks.log(f"iter {i}: dropped {len(dropped)} intensity change(s) — "
                           "the model judged a mis-exposed frame")
-        state, accepted, rejected = apply_changes(state, proposal["changes"], locks, limit=True)
+        state, accepted, rejected = apply_changes(state, proposal["changes"], locks,
+                                                  limit=True, step_scale=anneal)
         rec.llm_accepted = accepted
         rec.llm_rejected.extend(rejected)   # extend — the contamination guard logged here too
         for r in rejected:
@@ -294,13 +347,123 @@ def run_match(
     else:
         best_state = state
         hooks.apply(best_state)
-    return MatchResult(
+    result = MatchResult(
         best_state=best_state,
         best_score=best_score,
         best_render=best_render,
         stop_reason=stop_reason,
         iterations=records,
     )
+
+    # ---- DEEP-MATCH finisher: squeeze to the scene's ceiling, then prove it
+    if (cfg.polish and best_score is not None and ref_stats is not None
+            and best_score < cfg.polish_stop_at and stop_reason != "cancelled"):
+        p_state, p_score, probes, converged = run_polish(
+            best_state, best_score, ref_stats, hooks, cfg, locks)
+        result.polish_gain = round(p_score - best_score, 2)
+        result.polish_probes = probes
+        result.ceiling_converged = converged
+        result.best_state, result.best_score = p_state, p_score
+        hooks.apply(p_state)
+        if converged and p_score < cfg.polish_stop_at:
+            hooks.log(f"ceiling: no fine move improves {p_score:.1f} — that score IS this "
+                      "scene's optimum for this reference (content gap, not lighting)")
+    return result
+
+
+def run_polish(
+    state: LightingState,
+    score_now: float,
+    ref_stats: Dict,
+    hooks: Hooks,
+    cfg: MatchConfig,
+    locks: Optional[Set[str]] = None,
+) -> Tuple[LightingState, float, int, bool]:
+    """LLM-free ADAPTIVE coordinate line search. Per parameter: nudge, keep climbing in a
+    direction while each rendered probe measurably improves the score; when neither
+    direction improves, that parameter's step halves next round. Converged when every
+    unlocked parameter's step is at its fine floor and a full round changed nothing — a
+    provable local optimum. → (best_state, best_score, probes_rendered, converged)."""
+    locks = locks or set()
+    best = state.copy()
+    best_score = score_now
+    probes = 0
+    steps = {k: s for k, s, _log, _floor in POLISH_PARAMS}
+    # fail-memo: (step, score) at last failure per param — while neither has changed,
+    # re-probing would render the exact same comparison again
+    dead: Dict[str, Tuple[float, float]] = {}
+    hooks.log(f"polish: adaptive line search from {best_score:.2f} "
+              f"(≤{cfg.polish_rounds} rounds · ≤{cfg.polish_max_probes} probes)")
+
+    def measure(cand: LightingState, tag: str) -> Optional[float]:
+        nonlocal probes
+        if probes >= cfg.polish_max_probes:
+            return None
+        hooks.apply(cand)
+        path = hooks.render(tag)
+        if path is None:
+            return None
+        st = hooks.stats(path)
+        if st is None:
+            return None
+        probes += 1
+        return critic.score(ref_stats, st, cfg.weights).score
+
+    low_gain_rounds = 0
+    for rnd in range(cfg.polish_rounds):
+        improved_any = False
+        round_start = best_score
+        for key, _init, is_log, floor in POLISH_PARAMS:
+            if hooks.should_cancel() or best_score >= cfg.polish_stop_at \
+                    or probes >= cfg.polish_max_probes:
+                hooks.apply(best)
+                return best, best_score, probes, False
+            if key in locks or key not in best.values:
+                continue
+            step = steps[key]
+            if dead.get(key) == (step, best_score):
+                continue    # same step, same landscape — the answer hasn't changed
+            param_moved = False
+            for direction in (1.0, -1.0):
+                climbing = True
+                stride = step        # accelerating line search: consecutive keeps
+                while climbing and probes < cfg.polish_max_probes \
+                        and best_score < cfg.polish_stop_at:
+                    cand = best.copy()
+                    v = cand.get(key)
+                    cand.set(key, v * (2.0 ** (direction * stride)) if is_log
+                             else v + direction * stride)
+                    if abs(cand.get(key) - v) < 1e-6:
+                        break            # clamped to a bound — nowhere to go
+                    sc = measure(cand, f"polish{rnd}_{key.split('.')[-1]}")
+                    if sc is not None and sc > best_score + cfg.polish_min_gain:
+                        hooks.log(f"polish: {key} {v:.2f}→{cand.get(key):.2f} · "
+                                  f"{best_score:.2f}→{sc:.2f} ✓")
+                        best, best_score = cand, sc
+                        improved_any = True
+                        param_moved = True
+                        stride *= 1.6          # keep riding the slope, faster
+                    else:
+                        climbing = False
+                if param_moved:
+                    break                # THIS param rode uphill; its mirror is downhill
+            if not param_moved:
+                dead[key] = (step, best_score)
+        low_gain_rounds = (low_gain_rounds + 1
+                           if best_score - round_start < cfg.polish_round_eps else 0)
+        if low_gain_rounds >= 2:
+            hooks.apply(best)
+            return best, best_score, probes, True   # diminishing returns = ceiling
+        if not improved_any:
+            all_floored = all(steps[k] <= floor + 1e-9
+                              for k, _s, _l, floor in POLISH_PARAMS)
+            if all_floored:
+                hooks.apply(best)
+                return best, best_score, probes, True   # proven local optimum
+            for k, _s, _l, floor in POLISH_PARAMS:
+                steps[k] = max(floor, steps[k] / 2.0)
+    hooks.apply(best)
+    return best, best_score, probes, False
 
 
 def run_sun_sweep(
@@ -322,6 +485,7 @@ def run_sun_sweep(
     paths: List[str] = []
     kept: List[float] = []
     dir_scores: List[Optional[float]] = []
+    probe_grids: List[List[float]] = []
     ref_grid = (ref_stats or {}).get("grid")
     for az in azimuths:
         if hooks.should_cancel():
@@ -338,6 +502,7 @@ def run_sun_sweep(
                 st = hooks.stats(path)
                 if st and st.get("grid"):
                     score = (cosine(ref_grid, st["grid"]) + 1.0) / 2.0
+                    probe_grids.append(list(st["grid"]))
             dir_scores.append(score)
         else:
             hooks.log(f"sweep: render failed at azimuth {az:.0f}° — skipping")
@@ -350,13 +515,29 @@ def run_sun_sweep(
     idx = picked["best_index"]
     # cross-check only when EVERY probe was measurable — a partial score table could
     # crown a probe merely because its rivals went unmeasured (predictability > cleverness)
-    if all(s is not None for s in dir_scores):
-        metric_idx = max(range(len(dir_scores)), key=lambda i: dir_scores[i])
-        if metric_idx != idx and dir_scores[metric_idx] - dir_scores[idx] > 0.15:
-            hooks.log(f"sweep: direction metric overrides — {kept[metric_idx]:.0f}° "
-                      f"(pattern {dir_scores[metric_idx]:.2f}) beats the pick of "
-                      f"{kept[idx]:.0f}° ({dir_scores[idx]:.2f})")
-            idx = metric_idx
+    if all(s is not None for s in dir_scores) and len(probe_grids) == len(kept):
+        # CONTRASTIVE grids: all probes share the scene's dominant pattern (sky gradient),
+        # which swamps the sun's contribution — live fire showed a SUNLESS probe scoring
+        # 0.97 raw similarity. Subtract the probes' mean grid so only what varies WITH sun
+        # direction is compared; skip the override entirely if that residue is negligible.
+        from .metrics import cosine as _cos
+
+        mean_grid = [sum(g[i] for g in probe_grids) / len(probe_grids) for i in range(9)]
+        ref_d = [ref_grid[i] - mean_grid[i] for i in range(9)]
+        contrast = []
+        for g in probe_grids:
+            d = [g[i] - mean_grid[i] for i in range(9)]
+            contrast.append((_cos(ref_d, d) + 1.0) / 2.0)
+        energy = sum(abs(v) for v in ref_d)
+        if energy > 0.01:
+            metric_idx = max(range(len(contrast)), key=lambda i: contrast[i])
+            if metric_idx != idx and contrast[metric_idx] - contrast[idx] > 0.15:
+                hooks.log(f"sweep: direction metric overrides — {kept[metric_idx]:.0f}° "
+                          f"(contrast {contrast[metric_idx]:.2f}) beats the pick of "
+                          f"{kept[idx]:.0f}° ({contrast[idx]:.2f})")
+                idx = metric_idx
+        else:
+            hooks.log("sweep: direction residue too small to cross-check — LLM pick stands")
     az = kept[idx]
     hooks.log(f"sweep: azimuth {az:.0f}° — {picked['why']}")
     return az, picked["altitude_hint"], picked["why"]

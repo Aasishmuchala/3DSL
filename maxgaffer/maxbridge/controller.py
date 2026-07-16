@@ -355,10 +355,12 @@ class Controller:
         log(f"run dir: {run_dir}")
 
         # snapshot the light as it stands — matches are explorations, not commitments
-        # (unless the plan stage of this same run already snapshotted the true start)
-        if getattr(self, "_plan_snapped", None) == camera_name:
-            self._plan_snapped = None
-        else:
+        # (unless the plan stage of this same run already snapshotted the true start).
+        # The flag is cleared UNCONDITIONALLY: a stale flag from an aborted plan on
+        # another camera must never suppress a later snapshot.
+        snapped_for = getattr(self, "_plan_snapped", None)
+        self._plan_snapped = None
+        if snapped_for != camera_name:
             e.pre_match = ap.read_state(rig, self._baselines, cam)
         self.save_session()
 
@@ -455,6 +457,9 @@ class Controller:
         queue = [name for name, e in self.session.cameras.items() if e.reference]
         if not queue:
             return {"": "no cameras have references bound"}
+        if self.cfg.plan_first:
+            log("note: scene-wide plans run on single MATCH only — the batch queue uses "
+                "the match loop (plans need your preview)")
         for i, name in enumerate(queue):
             if should_cancel():
                 results[name] = "cancelled"

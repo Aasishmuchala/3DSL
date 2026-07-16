@@ -154,6 +154,18 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                                                    op["placement"])
                         except Exception:
                             report["warnings"].append(f"{op['name']}: placement failed")
+                    if op["light_type"] == "VRaySun" and basis is not None:
+                        # a targetless scripted VRaySun aims straight down — give it a
+                        # target at the camera's subject so its direction is meaningful
+                        try:
+                            tgt = rt.Targetobject()
+                            lx, ly, lz = basis["look"]
+                            tgt.pos = rt.Point3(lx, ly, lz)
+                            tgt.name = op["name"] + "_target"
+                            node.target = tgt
+                        except Exception:
+                            report["warnings"].append(
+                                f"{op['name']}: could not create a sun target")
                     if op.get("aim_at_camera_target") and basis is not None:
                         try:
                             lx, ly, lz = basis["look"]

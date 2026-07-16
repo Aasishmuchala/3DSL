@@ -28,6 +28,10 @@ CREATABLE_LIGHTS = ("VRayLight_plane", "VRayLight_sphere", "VRayLight_disc",
                     "VRayLight_dome", "VRaySun", "VRayIES")
 PLACEMENT_LIMITS = {"bearing_deg": (-180.0, 180.0), "distance": (10.0, 100000.0),
                     "height": (-10000.0, 100000.0)}
+# "anything related to LIGHT" is the mandate — output paths, DR/net-render and system
+# plumbing on the renderer are never light, and a stray write there hurts a client job
+RENDERER_DENY_SUBSTR = ("savefilename", "rawfilename", "distributed", "netrender",
+                        "autosave", "region", "system_")
 
 PLAN_SYSTEM = """You are a master gaffer with FULL access to a 3ds Max + V-Ray 7 scene. You
 will receive the scene digest (current renderer settings, environment, exposure control,
@@ -47,6 +51,8 @@ You may:
 Hard rules:
 - AT MOST 12 operations, highest impact first. Prefer adjusting existing lights over
   creating new ones; create only what the reference clearly needs and the scene lacks.
+- VRayIES lights are useless without an .ies profile — only create one if you set its
+  file via props, otherwise use a VRayLight_sphere/disc instead.
 - Only property names that appear in the digest. Never invent names.
 - Values: numbers, true/false, [r,g,b] 0-255 colors, or strings (file paths).
 - Do not change resolution, output paths, or anything unrelated to LIGHT.
@@ -97,6 +103,7 @@ def validate_plan(reply_text: str, cat: Dict[str, Set[str]],
     rejected: List[str] = []
     raw_ops = obj.get("ops")
     existing_names = {t[len("node:"):] for t in cat if t.startswith("node:")}
+    created_names: Set[str] = set()   # lights this plan creates — settable later in-plan
     for item in (raw_ops if isinstance(raw_ops, list) else [])[:max_ops * 2]:
         if len(ops) >= max_ops:
             rejected.append("plan truncated at 12 operations")
@@ -109,11 +116,20 @@ def validate_plan(reply_text: str, cat: Dict[str, Set[str]],
             target = item.get("target")
             prop = item.get("prop")
             value = item.get("value")
-            if not (isinstance(target, str) and target in cat):
+            on_created = (isinstance(target, str) and target.startswith("node:")
+                          and target[len("node:"):] in created_names)
+            if not (isinstance(target, str) and (target in cat or on_created)):
                 rejected.append(f"set: unknown target {target!r}")
                 continue
-            if not (isinstance(prop, str) and prop in cat[target]):
+            if not on_created and not (isinstance(prop, str) and prop in cat[target]):
                 rejected.append(f"set {target}: property {prop!r} not in the scene digest")
+                continue
+            if on_created and not isinstance(prop, str):
+                continue
+            if target == "renderer" and any(d in prop.lower()
+                                            for d in RENDERER_DENY_SUBSTR):
+                rejected.append(f"set renderer.{prop}: output/system plumbing is off-limits "
+                                "(not light)")
                 continue
             if not _valid_value(value):
                 rejected.append(f"set {target}.{prop}: unsupported value {value!r}")
@@ -161,6 +177,7 @@ def validate_plan(reply_text: str, cat: Dict[str, Set[str]],
                         "aim_at_camera_target": bool(item.get("aim_at_camera_target")),
                         "props": clean_props, "why": why})
             existing_names.add(name)
+            created_names.add(name)
         else:
             rejected.append(f"unknown op {kind!r}")
     meta = {"read": str(obj.get("read") or "")[:600],

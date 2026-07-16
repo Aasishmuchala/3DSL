@@ -108,12 +108,16 @@ def initial_state(
         "reference white-balance feel")
 
     # ---- practicals: on → they contribute (and at night they carry the frame);
-    # off in a daytime reference → kill them; off at night → leave authored (moonlight looks)
+    # off in a daytime reference → kill them; off at night → leave authored (moonlight looks).
+    # MG_ groups are exempt from the kill — those are MaxGaffer's OWN plan-created match
+    # instruments (fills, rims), not scene practicals; zeroing them would undo the plan.
     practicals = bool(semantics.get("practicals_on", False))
     for group in st.groups:
         key = GROUP_PREFIX + group
         if practicals:
             put(key, max(1.0, st.get(key, 1.0)), "reference shows practicals contributing")
+        elif group.startswith("MG_"):
+            continue
         elif time_of_day not in ("night", "blue_hour"):
             put(key, 0.0, "daylight reference with no practical contribution")
 

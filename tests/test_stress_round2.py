@@ -160,3 +160,18 @@ def test_center_weighted_key(tmp_path):
     # same pixel population, opposite placement — the center-weighted key must differ,
     # brighter-center strictly higher
     assert bright_c["log_key"] > dark_c["log_key"] * 1.5
+
+
+# --------------------------------------------------------------- run-dir pruning (v0.2)
+def test_prune_old_runs(tmp_path):
+    from maxgaffer.maxbridge.controller import prune_old_runs
+
+    for stamp in ("20260701-090000", "20260702-090000", "20260703-090000",
+                  "20260704-090000", "20260705-090000"):
+        (tmp_path / stamp).mkdir()
+    (tmp_path / "not_a_dir.txt").write_text("x")
+    assert prune_old_runs(str(tmp_path), keep=2) == 3
+    left = sorted(p.name for p in tmp_path.iterdir() if p.is_dir())
+    assert left == ["20260704-090000", "20260705-090000"]     # newest survive
+    assert prune_old_runs(str(tmp_path), keep=0) == 0          # 0 = keep everything
+    assert prune_old_runs(str(tmp_path / "missing"), keep=2) == 0

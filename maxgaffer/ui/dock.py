@@ -12,6 +12,7 @@ Loaded inside 3ds Max only (bootstrap checks deps first).
 
 from __future__ import annotations
 
+import html as _html
 import os
 from typing import Dict, List, Optional
 
@@ -190,7 +191,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         mrow.addWidget(self.btn_cancel)
         lm.addLayout(mrow)
 
-        self.log = QtWidgets.QPlainTextEdit()
+        self.log = QtWidgets.QTextEdit()      # rich text: iteration thumbnails render inline
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(150)
         lm.addWidget(self.log)
@@ -203,6 +204,11 @@ class MaxGafferDock(QtWidgets.QWidget):
                                "camera's last match run (snapshotted automatically).")
         btn_restore.clicked.connect(self._restore_pre_match)
         lrow.addWidget(btn_restore)
+        self.btn_ab = QtWidgets.QPushButton("A/B")
+        self.btn_ab.setToolTip("Flip between the pre-match light (A) and the matched "
+                               "light (B) — Vantage mirrors the flip.")
+        self.btn_ab.clicked.connect(self._ab_flip)
+        lrow.addWidget(self.btn_ab)
         lrow.addStretch(1)
         lm.addLayout(lrow)
         right.addWidget(g_match)
@@ -244,7 +250,11 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= helpers
     def _log(self, msg: str):
-        self.log.appendPlainText(msg)
+        if msg.startswith("THUMB::"):
+            url = QtCore.QUrl.fromLocalFile(msg[len("THUMB::"):]).toString()
+            self.log.append(f'<img src="{url}" width="240">')
+        else:
+            self.log.append(_html.escape(msg))
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
         QtWidgets.QApplication.processEvents()
 
@@ -301,6 +311,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         if self._busy:   # a match/batch is mid-flight — applying a saved state now would
             self._log("busy — camera switch ignored until the current run finishes")
             return       # yank the rig out from under the loop
+        self._ab_on_pre = False   # A/B toggle is per-camera-visit
         name = item.text(0)
         try:
             for w in self.ctrl.select_camera(name):
@@ -452,6 +463,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log(f"✗ unexpected: {err}")
         finally:
             self._busy = False
+            self._ab_on_pre = False        # a fresh match lands on B (matched)
             self.btn_match.setEnabled(True)
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
@@ -472,9 +484,27 @@ class MaxGafferDock(QtWidgets.QWidget):
         cam = self._current_camera()
         if cam and self.ctrl.restore_pre_match(cam):
             self._log(f"restored pre-match lighting for {cam}")
+            self._ab_on_pre = True
             self.rebuild_rig_controls()
         else:
             self._log("no pre-match snapshot for this camera yet")
+
+    def _ab_flip(self):
+        if self._busy:
+            return
+        cam = self._current_camera()
+        e = self.ctrl.session.cameras.get(cam) if cam else None
+        if not (e and e.pre_match is not None and e.state is not None):
+            self._log("A/B needs both a pre-match snapshot and a matched state — run a "
+                      "match first")
+            return
+        self._ab_on_pre = not getattr(self, "_ab_on_pre", False)
+        try:
+            self.ctrl.apply_state(e.pre_match if self._ab_on_pre else e.state, cam)
+            self._log(f"A/B → showing {'A (pre-match)' if self._ab_on_pre else 'B (matched)'}")
+            self.rebuild_rig_controls()
+        except Exception as err:  # noqa: BLE001
+            self._log(f"A/B failed: {err}")
 
     # ================================================================= vantage
     def _start_live_link(self):

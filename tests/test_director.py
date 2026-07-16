@@ -181,14 +181,15 @@ def test_no_llm_call_after_final_render():
     assert len(rig.llm_calls) == 1        # only between iter0 and iter1
 
 
-def test_sun_sweep_picks_and_applies():
+def test_sun_sweep_picks_applies_and_returns_altitude_hint():
     rig = Rig()
     hooks = rig.hooks()
-    az, why = run_sun_sweep(
+    az, hint, why = run_sun_sweep(
         start_state(), [0.0, 90.0, 180.0, 270.0], hooks,
         llm_pick=lambda paths, azs: json.dumps(
             {"best_index": 2, "altitude_hint": "golden", "why": "shadows fall left"}))
     assert az == 180.0
+    assert hint == "golden"
     assert "shadows" in why
     assert len(rig.renders) == 4
     # each probe applied its azimuth
@@ -198,11 +199,21 @@ def test_sun_sweep_picks_and_applies():
 def test_sun_sweep_survives_bad_reply_and_failed_probes():
     rig = Rig()
     hooks = rig.hooks()
-    az, why = run_sun_sweep(start_state(), [0.0, 90.0], hooks,
-                            llm_pick=lambda p, a: "nope")
-    assert az is None and "unusable" in why
+    az, hint, why = run_sun_sweep(start_state(), [0.0, 90.0], hooks,
+                                  llm_pick=lambda p, a: "nope")
+    assert az is None and hint == "na" and "unusable" in why
 
     hooks.render = lambda tag: None
-    az2, why2 = run_sun_sweep(start_state(), [0.0, 90.0], hooks,
-                              llm_pick=lambda p, a: "{}")
-    assert az2 is None and "not enough" in why2
+    az2, hint2, why2 = run_sun_sweep(start_state(), [0.0, 90.0], hooks,
+                                     llm_pick=lambda p, a: "{}")
+    assert az2 is None and hint2 == "na" and "not enough" in why2
+
+
+def test_altitude_hint_bands_all_mapped():
+    """Every altitude band the sweep can return must map to degrees in the rules table —
+    a missing key would silently skip the refinement."""
+    from maxgaffer.core.parse import ALTITUDE_BANDS
+    from maxgaffer.core.rules import ALTITUDE_DEG
+
+    for band in ALTITUDE_BANDS:
+        assert band in ALTITUDE_DEG

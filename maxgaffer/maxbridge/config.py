@@ -35,6 +35,7 @@ class Config:
     max_iterations: int = 5
     target_score: float = 82.0
     sweep_count: int = 8
+    keep_runs: int = 10                      # run folders kept per camera (0 = keep all)
     critic_weights: Dict[str, float] = field(default_factory=dict)   # override critic defaults
     repo_path: str = ""                      # clone folder, written by install.bat
 

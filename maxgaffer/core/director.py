@@ -279,16 +279,19 @@ def run_sun_sweep(
     hooks: Hooks,
     llm_pick: Callable[[List[str], List[float]], str],
     n_validate=None,
-) -> Tuple[Optional[float], str]:
+) -> Tuple[Optional[float], str, str]:
     """Grid-solve the sun direction: render one low-res frame per azimuth, let the LLM do
-    multiple-choice (estimation is hard, comparison is easy). Returns (azimuth | None, why)."""
+    multiple-choice (estimation is hard, comparison is easy).
+    Returns (azimuth | None, altitude_hint, why) — the hint comes from the same comparison
+    (the model sees real renders of THIS scene against the reference) so the caller should
+    prefer it over the ANALYZE pass's band when they disagree."""
     from .parse import validate_sweep
 
     paths: List[str] = []
     kept: List[float] = []
     for az in azimuths:
         if hooks.should_cancel():
-            return None, "cancelled"
+            return None, "na", "cancelled"
         probe = state.copy()
         probe.set("sun.azimuth_deg", az)
         hooks.apply(probe)
@@ -299,11 +302,11 @@ def run_sun_sweep(
         else:
             hooks.log(f"sweep: render failed at azimuth {az:.0f}° — skipping")
     if len(paths) < 2:
-        return None, "not enough sweep renders"
+        return None, "na", "not enough sweep renders"
     try:
         picked = validate_sweep(llm_pick(paths, kept), len(paths))
     except ParseError as e:
-        return None, f"sweep reply unusable: {e}"
+        return None, "na", f"sweep reply unusable: {e}"
     az = kept[picked["best_index"]]
     hooks.log(f"sweep: azimuth {az:.0f}° — {picked['why']}")
-    return az, picked["why"]
+    return az, picked["altitude_hint"], picked["why"]

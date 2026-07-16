@@ -72,11 +72,11 @@ per-shot cost known → decide default iterations/sweep for heavy scenes.
 
 | # | Item | Why / note |
 |---|---|---|
-| 1 | Consume sweep `altitude_hint` (2-band probe after azimuth pick) | free accuracy, ~20 LoC in director |
-| 2 | Per-iteration thumbnails in the log panel | trust + faster human abort |
-| 3 | A/B flip button (pre-match ↔ matched) | the director's favorite toggle |
+| 1 | ✅ **shipped v0.2** — sweep `altitude_hint` consumed (verify at P1) | free accuracy |
+| 2 | ✅ **shipped v0.2** — per-iteration thumbnails inline in the log (verify at P1) | trust + faster human abort |
+| 3 | ✅ **shipped v0.2** — A/B flip button pre-match ↔ matched (verify at P1) | the director's favorite toggle |
 | 4 | Draft-sampler session preset — OPT-IN, explicit banner + restore | loop cost is render cost; only after C2 timing data |
-| 5 | Run-dir auto-cleanup (keep last K runs/camera) | disk hygiene |
+| 5 | ✅ **shipped v0.2** — run-dir auto-prune, `keep_runs`=10 | disk hygiene |
 | 6 | Photometric/standard lights in groups | only if a real scene demands it |
 | 7 | EXR/ACES-aware stats (current: sRGB PNG/JPEG assumption) | needed the day refs arrive as EXR |
 | 8 | Sun-off alternative: intensity-dim mode if #13 shows VRaySky coupling | decided by Spike D |

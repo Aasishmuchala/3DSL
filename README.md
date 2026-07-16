@@ -69,13 +69,18 @@ Max's scripting listener for the pymxs/V-Ray/Vantage/rig checks too.
 4. **MATCH LIGHTING**. Watch the log — analysis → first guess → per-iteration score,
    analytic EV/WB, the model's changes with reasons. Watch Vantage — every apply syncs.
    Optional **sun sweep first** grid-solves the sun direction before iterating.
-5. Nudge sliders in **RIG** (live-applied → Vantage mirrors). The state is saved per camera;
+5. Judge it: iteration **thumbnails render inline in the log**, and the **A/B** button flips
+   the scene between pre-match (A) and matched (B) — Vantage mirrors the flip. **Restore
+   pre-match light** exits the experiment entirely.
+6. Nudge sliders in **RIG** (live-applied → Vantage mirrors). The state is saved per camera;
    re-selecting a camera re-applies its light (toggle on the board).
-6. **VANTAGE → Render ALL matched cameras**: each camera gets its saved state applied,
+7. **VANTAGE → Render ALL matched cameras**: each camera gets its saved state applied,
    a `.vrscene` exported, and a sequential `vantage_console` still at final resolution.
 
-Iteration renders go to `%LOCALAPPDATA%\MaxGaffer\sessions\<scene>\<camera>\<timestamp>\`.
-Per-camera bindings persist in `<scene>.maxgaffer.json` next to the .max file.
+Iteration renders go to `%LOCALAPPDATA%\MaxGaffer\sessions\<scene>\<camera>\<timestamp>\`
+(oldest runs auto-pruned, `keep_runs` in config, default 10). Per-camera bindings persist in
+`<scene>.maxgaffer.json` next to the .max file. The sun sweep also refines **altitude** from
+its winning candidate's hint, not just azimuth.
 
 ## ON-BOX VERIFICATION CHECKLIST (do these before first client use)
 

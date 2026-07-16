@@ -270,11 +270,16 @@ class Controller:
         for line in why:
             log("first guess: " + line)
 
+        def render_hook(tag: str):
+            path = rd.render_frame(cam, os.path.join(run_dir, f"{tag}.png"),
+                                   self.cfg.loop_width, self.cfg.loop_height)
+            if path:
+                log(f"THUMB::{path}")   # UI renders these markers as inline thumbnails
+            return path
+
         hooks = Hooks(
             apply=lambda st: self._apply_logged(rig, st, cam, log),
-            render=lambda tag: rd.render_frame(
-                cam, os.path.join(run_dir, f"{tag}.png"),
-                self.cfg.loop_width, self.cfg.loop_height),
+            render=render_hook,
             stats=self.stats_for,
             llm_deltas=self._llm_deltas_hook(ref_block),
             log=log,
@@ -283,11 +288,19 @@ class Controller:
 
         if do_sweep and rig.get("sun") is not None and "sun.azimuth_deg" not in locks:
             log(f"sun sweep: {self.cfg.sweep_count} directions…")
-            az, _why = run_sun_sweep(
+            az, alt_hint, _why = run_sun_sweep(
                 start, rules.sweep_azimuths(self.cfg.sweep_count), hooks,
                 llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs))
             if az is not None:
                 start.set("sun.azimuth_deg", az)
+                # the hint was judged against real renders of THIS scene — trust it over
+                # the ANALYZE band when the altitude isn't locked
+                if alt_hint != "na" and "sun.altitude_deg" not in locks \
+                        and "sun.altitude_deg" in start.values:
+                    start.set("sun.altitude_deg", rules.ALTITUDE_DEG.get(
+                        alt_hint, start.get("sun.altitude_deg")))
+                    log(f"sweep: altitude refined to "
+                        f"{start.get('sun.altitude_deg'):.0f}° ('{alt_hint}')")
 
         cfg = MatchConfig(
             max_iterations=int(self.cfg.max_iterations),
@@ -374,10 +387,31 @@ class Controller:
         return d
 
     def _new_run_dir(self, camera_name: str) -> str:
-        d = os.path.join(self._ensure_run_dir(_safe(camera_name)), _stamp())
+        parent = self._ensure_run_dir(_safe(camera_name))
+        d = os.path.join(parent, _stamp())
         os.makedirs(d, exist_ok=True)
         self._run_dir = d
+        prune_old_runs(parent, keep=int(self.cfg.keep_runs))
         return d
+
+
+def prune_old_runs(parent_dir: str, keep: int) -> int:
+    """Delete the oldest run folders beyond ``keep`` (timestamp names sort chronologically).
+    keep <= 0 disables pruning. Returns how many were removed."""
+    if keep <= 0:
+        return 0
+    try:
+        dirs = sorted(d for d in os.listdir(parent_dir)
+                      if os.path.isdir(os.path.join(parent_dir, d)))
+    except OSError:
+        return 0
+    removed = 0
+    for d in dirs[:-keep]:
+        import shutil
+
+        shutil.rmtree(os.path.join(parent_dir, d), ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def _safe(name: str) -> str:

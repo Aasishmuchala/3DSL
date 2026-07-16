@@ -1,5 +1,8 @@
 # MaxGaffer
 
+> Spec: **[SPEC.md](SPEC.md)** (v2, post stress-test — locked decisions, guards, reliability
+> model) · Forward plan: **[tasks/plan.md](tasks/plan.md)** (P0 on-box bring-up → v1.0).
+
 **The gaffer to MaxDirector's director.** Pick a camera from the shot board, hand it a
 lighting reference image, press **MATCH LIGHTING** — and MaxGaffer analyzes the reference,
 first-guesses a rig from gaffer craft tables, then iterates the scene's **sun, HDRI dome,

@@ -92,8 +92,9 @@ so controlling everything in Max is controlling Vantage's input.
    pre-match light** exits the experiment entirely.
 6. Nudge sliders in **RIG** (live-applied → Vantage mirrors). The state is saved per camera;
    re-selecting a camera re-applies its light (toggle on the board).
-7. **VANTAGE → Render ALL matched cameras**: each camera gets its saved state applied,
-   a `.vrscene` exported, and a sequential `vantage_console` still at final resolution.
+7. **Finals**: "Render ALL matched (V-Ray)" renders every camera under its own light at
+   final resolution, or "Export vrscenes → open Vantage" hands per-camera scenes to
+   Vantage's in-app Batch Render queue.
 
 Iteration renders go to `%LOCALAPPDATA%\MaxGaffer\sessions\<scene>\<camera>\<timestamp>\`
 (oldest runs auto-pruned, `keep_runs` in config, default 10). Per-camera bindings persist in

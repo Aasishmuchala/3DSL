@@ -20,14 +20,16 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..core import metrics, omega, prompts, rules
+from ..core import metrics, omega, planner, prompts, rules, scenedigest
 from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
 from ..core.session import Session, preset_dumps, preset_loads, sidecar_path
 from . import apply as ap
 from . import config as cfgmod
+from . import digest as dg
 from . import draft as df
+from . import execute as ex
 from . import render as rd
 from . import scene as sc
 from . import vantage as vt
@@ -254,6 +256,76 @@ class Controller:
                 model=self.cfg.model, max_tokens=2048))
         return call_llm
 
+    # ------------------------------------------------------------------ scene-wide plan
+    def make_plan(self, camera_name: str, log: Callable[[str], None]):
+        """READ (full digest) → UNDERSTAND (LLM sees ref + every current setting) →
+        PLAN (validated, digest-grounded ops). Returns (ops, lines, meta, raw_digest)."""
+        e = self.session.entry(camera_name)
+        if not e.reference:
+            raise RuntimeError("bind a reference image to this camera first")
+        # snapshot the genome part BEFORE the plan touches anything — Restore pre-match
+        # must return to the true starting light (the plan itself is one Ctrl+Z)
+        e.pre_match = ap.read_state(self.rig(refresh=True), self._baselines,
+                                    sc.get_camera(camera_name))
+        self._plan_snapped = camera_name
+        self.save_session()
+        log("reading the scene — every renderer/environment/exposure/light/camera setting…")
+        raw = dg.build_digest()
+        cat = scenedigest.catalog(raw)
+        n_props = sum(len(v) for v in cat.values())
+        log(f"digest: {len(raw.get('lights') or [])} lights · "
+            f"{len(raw.get('cameras') or [])} cameras · {n_props} settable properties")
+        semantics = self.analyze_reference(camera_name)
+        ref_block = self._image_block(e.reference)
+        if ref_block is None:
+            raise RuntimeError("reference image could not be prepared for the LLM")
+        text = planner.plan_user_text(scenedigest.to_text(raw), semantics, camera_name)
+        messages = [{"role": "user", "content": [ref_block, omega.text_block(text)]}]
+        reply = self.io(lambda: omega.call(self.cfg.api_key, planner.PLAN_SYSTEM, messages,
+                                           model=self.cfg.model, max_tokens=4096))
+        try:
+            ops, rejected, meta = planner.validate_plan(reply, cat)
+        except ParseError:
+            retry = messages + [
+                {"role": "assistant", "content": reply[:1500]},
+                {"role": "user", "content": "That was not valid JSON. Reply with ONLY the "
+                                            "JSON object, nothing else."}]
+            ops, rejected, meta = planner.validate_plan(self.io(lambda: omega.call(
+                self.cfg.api_key, planner.PLAN_SYSTEM, retry,
+                model=self.cfg.model, max_tokens=4096)), cat)
+        if meta.get("read"):
+            log("scene read: " + meta["read"])
+        for r in rejected:
+            log("plan rejected: " + r)
+        return ops, planner.describe_plan(ops), meta, raw
+
+    def execute_plan(self, ops, camera_name: str,
+                     log: Callable[[str], None]) -> Dict:
+        """Execute a validated plan (one undo record; MG_ layer for created lights) and
+        return the before/after change report. Rig is re-classified after — new lights
+        join the dimmer boards immediately."""
+        cam = sc.get_camera(camera_name)
+        report = ex.execute_plan(ops, cam)
+        for c in report["changes"]:
+            log(f"  {c['target']} · {c['prop']}: {c['before']} → {c['after']}")
+        for c in report["created"]:
+            log(f"  + {c['type']} '{c['name']}' at {c['at']}")
+        for w in report["warnings"]:
+            log("  ⚠ " + w)
+        self.rig(refresh=True)
+        return report
+
+    def state_change_rows(self, camera_name: str) -> List[Dict]:
+        """pre-match → current saved state, as popup rows (the classic loop's report)."""
+        e = self.session.cameras.get(camera_name)
+        if not (e and e.pre_match is not None and e.state is not None):
+            return []
+        rows = []
+        for key, (before, after) in sorted(e.pre_match.diff(e.state).items()):
+            rows.append({"target": camera_name, "prop": key,
+                         "before": round(before, 2), "after": round(after, 2), "why": ""})
+        return rows
+
     # ------------------------------------------------------------------ the headline act
     def run_match(
         self,
@@ -283,7 +355,11 @@ class Controller:
         log(f"run dir: {run_dir}")
 
         # snapshot the light as it stands — matches are explorations, not commitments
-        e.pre_match = ap.read_state(rig, self._baselines, cam)
+        # (unless the plan stage of this same run already snapshotted the true start)
+        if getattr(self, "_plan_snapped", None) == camera_name:
+            self._plan_snapped = None
+        else:
+            e.pre_match = ap.read_state(rig, self._baselines, cam)
         self.save_session()
 
         log("analyzing reference…")

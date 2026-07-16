@@ -167,6 +167,21 @@ class MaxGafferDock(QtWidgets.QWidget):
         # match group
         g_match = QtWidgets.QGroupBox("MATCH")
         lm = QtWidgets.QVBoxLayout(g_match)
+        prow = QtWidgets.QHBoxLayout()
+        self.chk_plan = QtWidgets.QCheckBox("scene-wide plan first")
+        self.chk_plan.setChecked(bool(self.cfg.plan_first))
+        self.chk_plan.setToolTip(
+            "Reads EVERY current setting (renderer, environment, exposure, all lights, "
+            "cameras), compares the scene to the reference, and writes an explicit change "
+            "plan — it may adjust any existing property and CREATE new lights (MG_ layer). "
+            "You preview the plan before it executes; one Ctrl+Z reverts the whole plan.")
+        prow.addWidget(self.chk_plan)
+        self.chk_auto_exec = QtWidgets.QCheckBox("auto-execute plan")
+        self.chk_auto_exec.setChecked(bool(self.cfg.auto_execute_plan))
+        self.chk_auto_exec.setToolTip("Skip the preview dialog and execute immediately.")
+        prow.addWidget(self.chk_auto_exec)
+        prow.addStretch(1)
+        lm.addLayout(prow)
         opts = QtWidgets.QHBoxLayout()
         self.chk_sweep = QtWidgets.QCheckBox("sun sweep first")
         self.chk_sweep.setChecked(True)   # a wrong sun direction wastes the whole run;
@@ -531,12 +546,26 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.cfg.max_iterations = int(self.spin_iters.value())
         self.cfg.target_score = float(self.spin_target.value())
         self.cfg.draft_sampler = self.chk_draft.isChecked()
+        self.cfg.plan_first = self.chk_plan.isChecked()
+        self.cfg.auto_execute_plan = self.chk_auto_exec.isChecked()
         self.log.clear()
         self._log(f"— match: {cam} —")
+        plan_report = None
         try:
-            # run_match stays on the MAIN thread (it applies states and renders); its
-            # gateway calls come back through ctrl.io → _run_blocking_io, so the UI
-            # breathes and Cancel stays clickable during LLM waits.
+            # everything scene-touching stays on the MAIN thread; gateway calls come back
+            # through ctrl.io → _run_blocking_io, so the UI breathes and Cancel works.
+            if self.chk_plan.isChecked():
+                ops, lines, meta, _raw = self.ctrl.make_plan(cam, log=self._log)
+                if not ops:
+                    self._log("plan: no operations proposed — continuing to the match loop")
+                elif self.chk_auto_exec.isChecked() or PlanPreviewDialog(
+                        lines, meta, self).exec():
+                    self._log(f"— executing plan ({len(ops)} ops) —")
+                    plan_report = self.ctrl.execute_plan(ops, cam, log=self._log)
+                    if meta.get("expects"):
+                        self._log("expected: " + meta["expects"])
+                else:
+                    self._log("plan declined — continuing with the match loop only")
             result = self.ctrl.run_match(
                 cam, log=self._log,
                 should_cancel=lambda: self._cancel,
@@ -544,6 +573,11 @@ class MaxGafferDock(QtWidgets.QWidget):
                 do_sweep=self.chk_sweep.isChecked())
             score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
             self._log(f"✓ done ({result.stop_reason}) — best {score}")
+            if self.cfg.show_report_popup:
+                ChangeReportDialog(plan_report,
+                                   self.ctrl.state_change_rows(cam),
+                                   f"{cam} — {result.stop_reason}, score {score}",
+                                   self).exec()
         except (OmegaError, RuntimeError) as err:
             self._log(f"✗ {err}")
         except Exception as err:  # noqa: BLE001
@@ -709,6 +743,89 @@ class MaxGafferDock(QtWidgets.QWidget):
             self.cfg.save()
             self.ctrl.cfg = self.cfg
             self._log("settings saved")
+
+
+class PlanPreviewDialog(QtWidgets.QDialog):
+    """The approval gate: the model's scene read + every operation it wants to run."""
+
+    def __init__(self, lines, meta, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MaxGaffer — change plan")
+        self.setStyleSheet(STYLE)
+        self.setMinimumWidth(560)
+        lay = QtWidgets.QVBoxLayout(self)
+        read = QtWidgets.QLabel(meta.get("read") or "")
+        read.setWordWrap(True)
+        read.setObjectName("dim")
+        lay.addWidget(read)
+        box = QtWidgets.QPlainTextEdit("\n".join(lines))
+        box.setReadOnly(True)
+        box.setMinimumHeight(220)
+        lay.addWidget(box)
+        note = QtWidgets.QLabel("Executes as ONE undo step · new lights land on the "
+                                "MG_lights layer.")
+        note.setObjectName("dim")
+        lay.addWidget(note)
+        row = QtWidgets.QHBoxLayout()
+        ok = QtWidgets.QPushButton(f"EXECUTE {len(lines)} OPS")
+        ok.setObjectName("primary")
+        ok.clicked.connect(self.accept)
+        row.addWidget(ok, 1)
+        skip = QtWidgets.QPushButton("Skip plan")
+        skip.clicked.connect(self.reject)
+        row.addWidget(skip)
+        lay.addLayout(row)
+
+
+class ChangeReportDialog(QtWidgets.QDialog):
+    """The 'scene changed' popup: values changed (before → after), lights placed, warnings."""
+
+    def __init__(self, plan_report, state_rows, headline, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MaxGaffer — scene changed")
+        self.setStyleSheet(STYLE)
+        self.setMinimumWidth(600)
+        lay = QtWidgets.QVBoxLayout(self)
+        head = QtWidgets.QLabel(headline)
+        head.setStyleSheet(f"color:{ACCENT};font-weight:600;letter-spacing:1px;")
+        lay.addWidget(head)
+        tree = QtWidgets.QTreeWidget()
+        tree.setHeaderLabels(["what", "before", "after", "why"])
+        tree.setRootIsDecorated(True)
+        tree.setColumnWidth(0, 240)
+
+        def add_group(title, rows, fmt):
+            if not rows:
+                return
+            top = QtWidgets.QTreeWidgetItem([f"{title} ({len(rows)})", "", "", ""])
+            top.setForeground(0, QtGui.QBrush(QtGui.QColor(ACCENT)))
+            tree.addTopLevelItem(top)
+            for r in rows:
+                top.addChild(QtWidgets.QTreeWidgetItem(fmt(r)))
+            top.setExpanded(True)
+
+        pr = plan_report or {"changes": [], "created": [], "warnings": []}
+        add_group("Plan — values changed", pr["changes"], lambda c: [
+            f"{c['target']} · {c['prop']}", str(c["before"]), str(c["after"]),
+            c.get("why", "")])
+        add_group("Plan — lights placed", pr["created"], lambda c: [
+            f"{c['type']}  '{c['name']}'", "", c["at"], c.get("why", "")])
+        add_group("Match loop — lighting values", state_rows, lambda c: [
+            c["prop"], str(c["before"]), str(c["after"]), ""])
+        add_group("Warnings", [{"w": w} for w in pr["warnings"]],
+                  lambda c: [c["w"], "", "", ""])
+        if tree.topLevelItemCount() == 0:
+            tree.addTopLevelItem(QtWidgets.QTreeWidgetItem(
+                ["no changes were applied", "", "", ""]))
+        lay.addWidget(tree)
+        note = QtWidgets.QLabel("Plan = one Ctrl+Z · match loop states restorable via "
+                                "'Restore pre-match light'.")
+        note.setObjectName("dim")
+        lay.addWidget(note)
+        ok = QtWidgets.QPushButton("OK")
+        ok.setObjectName("primary")
+        ok.clicked.connect(self.accept)
+        lay.addWidget(ok)
 
 
 class SettingsDialog(QtWidgets.QDialog):

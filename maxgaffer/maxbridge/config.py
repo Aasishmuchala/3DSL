@@ -43,6 +43,9 @@ class Config:
     sweep_count: int = 8
     keep_runs: int = 10                      # run folders kept per camera (0 = keep all)
     draft_sampler: bool = False              # opt-in: draft render settings during matches
+    plan_first: bool = True                  # scene-wide plan (any setting, create lights)
+    auto_execute_plan: bool = False          # skip the preview dialog (still one undo)
+    show_report_popup: bool = True           # "scene changed" popup after execution
     # "dim" is the DOC-BACKED default: VRaySky auto-binds to "the first enabled VRaySun"
     # (Chaos docs/forums), so disabling the sun can gut a VRaySky environment. "disable"
     # remains available for dome-only rigs.

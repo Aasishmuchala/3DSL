@@ -69,6 +69,9 @@ tests/                77 pytest, pure core, incl. round-2 stress + v0.3 regressi
 ## 4. The match pipeline (with guard placement)
 
 ```
+⓪ PLAN     (default ON) full digest (getPropNames on renderer/env/exposure/lights/cams)
+           → ►LLM change plan → digest-grounded validation → preview/auto → execute
+           (one undo, MG_ lights layer, before/after capture)      [scene-wide agent]
 ① SELECT   camera board → set viewport cam; apply saved per-camera state (toggle)
 ② BIND     reference image per camera (session-persisted; new ref invalidates analysis)
 ③ SNAPSHOT pre-match state saved                                    [restore-anytime]
@@ -82,6 +85,7 @@ tests/                77 pytest, pure core, incl. round-2 stress + v0.3 regressi
            → ►LLM deltas (sees ref+render+state table+history)
              → genome validation → CONTAMINATION GUARD if |ΔEV|≥1.5     [drop intensity moves]
 ⑧ LAND     best state re-applied · per-camera state+score+locks saved · leash diagnosis if hit
+⑧·5 REPORT "scene changed" popup: plan values before→after · lights placed · loop diffs
 ⑨ HAND     rig sliders (live-apply → Vantage mirrors) · locks · Restore pre-match
 ⑩ SHIP     all matched cameras → apply each state → vrscene each → vantage_console batch
            (exports main-thread; renders on worker; progress via Qt relay)

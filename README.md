@@ -61,6 +61,23 @@ I/O. There is no torch, no OpenCV, no required pip package.
 `python scripts/preflight.py [oc_key]` — anywhere — prints exactly what's ready; run it in
 Max's scripting listener for the pymxs/V-Ray/Vantage/rig checks too.
 
+## Agent mode — scene-wide plans (v0.5)
+
+With **scene-wide plan first** checked (default), MATCH runs the full agent flow:
+**read** every current setting (all V-Ray renderer properties, environment map, exposure
+control, every light with its full property list, cameras — introspected live, nothing
+memorized) → **understand + compare** (the model sees the digest AND the reference) →
+**plan** an explicit change list — any existing property on any target, plus NEW lights
+placed camera-relative (never raw world coordinates), always MG_-prefixed on the MG_lights
+layer → **preview** (or auto-execute) → **execute** as ONE undo step with before/after
+capture → the iterative match loop refines → a **"scene changed" popup** reports every
+value changed (before → after), every light placed, and any warnings.
+
+Grounding rule: the plan may only reference targets and property names that exist in the
+digest — full access to everything that exists, zero access to hallucinated names.
+Vantage note: Vantage 3.3 exposes no external settings API; it renders what Max streams,
+so controlling everything in Max is controlling Vantage's input.
+
 ## Using it
 
 1. **Refresh** — the camera board lists every camera (name · ref-dot · last score).

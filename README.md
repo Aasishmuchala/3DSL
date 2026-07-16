@@ -94,17 +94,42 @@ tuples in `maxbridge/scene.py` / `exposure.py` if your build differs.
 | 10 | Loop render writes PNG with VFB off, respects size, restores render setup | select camera → MATCH with 1 iteration → check the run folder | `render.render_frame` |
 | 11 | Sun move on a Daylight-assembly sun (controller-locked transforms warn in rig notes) | try a scene with a Daylight system | `scene.classify_rig` note / detach sun |
 | 12 | Sidecar (optional): point Settings → system python at any Pillow-equipped python | `python -m maxgaffer.sidecar.metrics_cli some.jpg` prints stats JSON | `config.system_python` |
+| 13 | Sun-off looks: disabling VRaySun must not black out a VRaySky-driven environment | rules set `sun.enabled 0` for overcast refs — toggle it manually once and check the env | `core/rules.py` (keep sun on, intensity ↓ instead) |
+| 14 | GPU contention: Vantage live link + V-Ray GPU loop renders on one card | run a match with the link up on a heavy scene; if VRAM-starved, set V-Ray to CPU for matching or close the link during MATCH | workflow note, no code |
+
+## Known failure modes (stress-tested, round 2)
+
+* **Albedo trap** — the reference and your scene are *different rooms*: matching a white
+  Scandinavian reference inside a dark-walnut scene biases the exposure/WB solver (it can
+  only see histograms, not albedo). Round-2 defenses: the key is **center-weighted** (60/40),
+  the solver runs on a **leash** (±4 EV / ±3000 K total per run), and hitting the leash twice
+  prints an explicit diagnosis telling you to lock `exposure.ev` and set it by eye. That is
+  the honest limit of statistics across different scenes.
+* **Contaminated iterations** — when the solver had to move EV ≥ 1.5 stops, the render the
+  model just critiqued was badly mis-exposed, so its intensity/group proposals are dropped
+  for that iteration (geometry proposals survive). Logged when it happens.
+* **Loop cost is render cost** — iteration renders use your current V-Ray sampler at
+  `loop_width` (480 px default). On a heavy interior that's minutes per iteration ×
+  (8 sweep + N iterations). MaxGaffer deliberately never touches sampler settings (contract:
+  render setups are the artist's); use a draft preset for matching sessions if needed.
+* **Matches are explorations** — the pre-match light is snapshotted automatically per camera;
+  **Restore pre-match light** puts it back exactly. Baselines for practical groups are
+  adopted once (by light name, persisted) and never re-captured, so MaxGaffer dimming a
+  group to 0 can never poison its authored value.
 
 Known v1 limits (deliberate): VRayLights/VRayIES only for practical groups (no photometric),
 one sun + one dome (extras are ignored with a note), no volumetrics/aerial-perspective
-matching yet, no per-light solo — groups are layer-based dimmer boards.
+matching yet, no per-light solo — groups are layer-based dimmer boards, and the sweep's
+altitude hint is not yet consumed (azimuth only).
 
 ## Dev (off-Max, any OS)
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install pytest pillow
-.venv/bin/python -m pytest tests/ -q          # 60+ tests, all pure core
+.venv/bin/python -m pytest tests/ -q          # ~70 tests, all pure core
 ```
 
-The suite already catches the classics: EV/WB sign conventions, the 180°-wrap ambiguity,
-LLM junk replies, slump-revert, lock enforcement, stdlib-vs-Pillow stats agreement.
+The suite catches the classics: EV/WB sign conventions, the 180°-wrap ambiguity, LLM junk
+replies, slump-revert, lock enforcement, stdlib-vs-Pillow stats agreement — plus the round-2
+stress regressions (baseline poisoning, analytic leash, contamination guard, center-weighted
+key, pre-match persistence).

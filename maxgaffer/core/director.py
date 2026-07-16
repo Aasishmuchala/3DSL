@@ -39,6 +39,16 @@ class MatchConfig:
     analytic: bool = True         # run the EV/WB histogram solver each iteration
     max_changes: int = 4
     weights: Optional[Dict[str, float]] = None
+    # analytic LEASH — total movement from the run's start state. The solver matches
+    # histograms of DIFFERENT scenes, so scene-vs-reference albedo mismatch (white room
+    # matched to a walnut library) biases it systematically; the leash bounds the damage
+    # and hitting it is reported as a diagnosis, not silently absorbed.
+    ev_leash: float = 4.0
+    wb_leash: float = 3000.0
+    # when the solver had to move EV by more than this in one iteration, the render the
+    # LLM just saw was badly mis-exposed — its absolute-brightness judgments (intensities,
+    # group levels) are contaminated and get dropped for that iteration
+    contaminated_ev_step: float = 1.5
 
 
 @dataclass
@@ -100,6 +110,11 @@ def run_match(
     slump_count = 0
     stall_count = 0
     stop_reason = "max_iterations"
+    leash_ev_lo = start_state.get("exposure.ev", 10.0) - cfg.ev_leash
+    leash_ev_hi = start_state.get("exposure.ev", 10.0) + cfg.ev_leash
+    leash_wb_lo = start_state.get("exposure.wb_kelvin", 6500.0) - cfg.wb_leash
+    leash_wb_hi = start_state.get("exposure.wb_kelvin", 6500.0) + cfg.wb_leash
+    leash_hits = 0
 
     for i in range(cfg.max_iterations):
         if hooks.should_cancel():
@@ -163,6 +178,19 @@ def run_match(
         analytic: Dict[str, float] = {}
         if cfg.analytic and cur_stats is not None and ref_stats is not None:
             analytic = solver.analytic_pass(state, ref_stats, cur_stats, locks)
+            if "exposure.ev" in analytic:
+                leashed = min(leash_ev_hi, max(leash_ev_lo, analytic["exposure.ev"]))
+                if abs(leashed - analytic["exposure.ev"]) > 1e-6:
+                    leash_hits += 1
+                    hooks.log(f"iter {i}: EV solve hit its leash "
+                              f"({leashed:+.1f} vs wanted {analytic['exposure.ev']:+.1f})")
+                analytic["exposure.ev"] = leashed
+            if "exposure.wb_kelvin" in analytic:
+                leashed = min(leash_wb_hi, max(leash_wb_lo, analytic["exposure.wb_kelvin"]))
+                if abs(leashed - analytic["exposure.wb_kelvin"]) > 1e-6:
+                    leash_hits += 1
+                    hooks.log(f"iter {i}: WB solve hit its leash ({leashed:.0f}K)")
+                analytic["exposure.wb_kelvin"] = leashed
             if analytic:
                 state, accepted, _ = apply_changes(state, analytic, locks, limit=False)
                 rec.analytic_changes = accepted
@@ -195,8 +223,27 @@ def run_match(
         rec.assessment = proposal["assessment"]
         if proposal["assessment"]:
             hooks.log(f"iter {i}: gaffer: {proposal['assessment']}")
+        # contaminated-iteration guard: if the solver just moved EV substantially, the
+        # render the LLM critiqued was mis-exposed — drop its absolute-brightness moves
+        # (rec.state snapshots the iteration-start values, so new-vs-start is the movement)
+        ev_before = rec.state.get("values", {}).get("exposure.ev")
+        ev_after = rec.analytic_changes.get("exposure.ev")
+        ev_moved = (abs(ev_after - ev_before)
+                    if (ev_before is not None and ev_after is not None) else 0.0)
+        if ev_moved >= cfg.contaminated_ev_step:
+            dropped = [k for k in proposal["changes"]
+                       if k.endswith(".intensity") or k.startswith("group.")]
+            for k in dropped:
+                proposal["changes"].pop(k, None)
+                rec.llm_rejected.append(
+                    f"{k}: dropped — render was {ev_moved:.1f} stops mis-exposed, "
+                    "brightness judgment contaminated")
+            if dropped:
+                hooks.log(f"iter {i}: dropped {len(dropped)} intensity change(s) — "
+                          "the model judged a mis-exposed frame")
         state, accepted, rejected = apply_changes(state, proposal["changes"], locks, limit=True)
-        rec.llm_accepted, rec.llm_rejected = accepted, rejected
+        rec.llm_accepted = accepted
+        rec.llm_rejected.extend(rejected)   # extend — the contamination guard logged here too
         for r in rejected:
             hooks.log(f"iter {i}: rejected {r}")
         for k, v in accepted.items():
@@ -205,6 +252,11 @@ def run_match(
         if proposal["stop"] and not accepted and not rec.analytic_changes:
             stop_reason = "llm_satisfied"
             break
+
+    if leash_hits >= 2:
+        hooks.log("⚠ the exposure/WB solver kept hitting its leash — the reference and "
+                  "this scene likely disagree in albedo (e.g. white room vs dark wood). "
+                  "Consider locking exposure.ev / exposure.wb_kelvin and setting them by eye.")
 
     # ---- always land on the best known state
     if best_score is not None:

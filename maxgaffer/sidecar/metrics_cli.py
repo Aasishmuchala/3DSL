@@ -33,8 +33,14 @@ def main(argv=None) -> int:
     if not paths:
         print(json.dumps({"error": "usage: metrics_cli IMAGE [IMAGE...] [--b64]"}))
         return 2
-    sys.path.insert(0, __file__.rsplit("maxgaffer", 1)[0])
-    from maxgaffer.core import metrics
+    try:
+        from maxgaffer.core import metrics
+    except ImportError:  # invoked by file path rather than -m: add the repo root
+        import os
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))))
+        from maxgaffer.core import metrics
 
     out = []
     for p in paths:

@@ -1,9 +1,11 @@
 """LightingState → scene, and scene → LightingState. One undo record per apply.
 
-Group multipliers are FACTORS over the lights' authored values: baselines are captured the
-first time a rig is touched (per anim-handle) so repeated applies never compound. Everything
-is candidates-based and per-parameter fault-isolated — one missing property must not stop
-the sun from moving.
+Group multipliers are FACTORS over the lights' AUTHORED values. Baselines are keyed by
+light NAME and live in the Session (adopt-once, never overwrite) — names survive Max
+restarts, and adopt-once is what makes re-scanning a rig safe after MaxGaffer itself has
+dimmed a group (re-capturing would read 0 and poison the group forever). Everything is
+candidates-based and per-parameter fault-isolated — one missing property must not stop the
+sun from moving.
 """
 
 from __future__ import annotations
@@ -21,28 +23,31 @@ def _rt():
     return pymxs.runtime
 
 
-def _handle(node) -> int:
+def _light_name(node) -> str:
     try:
-        return int(_rt().getHandleByAnim(node))
+        return str(node.name)
     except Exception:
-        return id(node)
+        return ""
 
 
-def capture_baselines(rig: Dict[str, Any]) -> Dict[int, float]:
-    """{anim_handle: authored multiplier} for every group light. Idempotent by design —
-    call once and cache; re-capturing after MaxGaffer changed the lights would poison it."""
-    out: Dict[int, float] = {}
+def capture_baselines(rig: Dict[str, Any]) -> Dict[str, float]:
+    """{light_name: current multiplier} for every group light — a CANDIDATE set. Feed it
+    through ``Session.adopt_baselines`` (adopt-only-new); never use it to overwrite."""
+    out: Dict[str, float] = {}
     for lights in (rig.get("groups") or {}).values():
         for lt in lights:
+            name = _light_name(lt)
+            if not name:
+                continue
             v = sc.get_prop(lt, sc.LIGHT_MULT, 1.0)
             try:
-                out[_handle(lt)] = float(v)
+                out[name] = float(v)
             except (TypeError, ValueError):
-                out[_handle(lt)] = 1.0
+                out[name] = 1.0
     return out
 
 
-def read_state(rig: Dict[str, Any], baselines: Dict[int, float],
+def read_state(rig: Dict[str, Any], baselines: Dict[str, float],
                camera=None) -> LightingState:
     """Current scene → genome (only the params this rig actually supports)."""
     st = LightingState()
@@ -75,7 +80,7 @@ def read_state(rig: Dict[str, Any], baselines: Dict[int, float],
     for group, lights in (rig.get("groups") or {}).items():
         factors: List[float] = []
         for lt in lights:
-            base = baselines.get(_handle(lt), 1.0) or 1.0
+            base = baselines.get(_light_name(lt), 1.0) or 1.0
             v = sc.get_prop(lt, sc.LIGHT_MULT, base)
             try:
                 factors.append(float(v) / base)
@@ -95,7 +100,7 @@ def read_state(rig: Dict[str, Any], baselines: Dict[int, float],
     return st
 
 
-def apply_state(rig: Dict[str, Any], baselines: Dict[int, float], state: LightingState,
+def apply_state(rig: Dict[str, Any], baselines: Dict[str, float], state: LightingState,
                 camera=None) -> List[str]:
     """Write the state to the scene inside one undo record. Returns warnings (params the
     rig couldn't take)."""
@@ -145,7 +150,7 @@ def _apply_inner(rig, baselines, state: LightingState, camera, warnings: List[st
 
     for group, factor in state.groups.items():
         for lt in (rig.get("groups") or {}).get(group, []):
-            base = baselines.get(_handle(lt), 1.0)
+            base = baselines.get(_light_name(lt), 1.0)
             if sc.set_prop(lt, sc.LIGHT_MULT, float(base) * float(factor)) is None:
                 warnings.append(f"group.{group}: light '{getattr(lt, 'name', '?')}' "
                                 "has no multiplier")

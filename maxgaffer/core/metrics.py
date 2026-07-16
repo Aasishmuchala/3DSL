@@ -22,23 +22,25 @@ HUE_BINS = 12
 
 
 # --------------------------------------------------------------------------- pixel loading
-def _load_pixels(path: str, max_dim: int = 256) -> Optional[List[Tuple[int, int, int]]]:
-    """Flat list of (r,g,b) 0-255, subsampled. Pillow first, stdlib PNG floor second."""
+def _load_pixels(path: str, max_dim: int = 256):
+    """→ (flat [(r,g,b)…], width, height) subsampled, or None. Pillow first, stdlib PNG
+    floor second. Dimensions are kept so the key can be center-weighted."""
     try:
         from PIL import Image  # type: ignore
 
         with Image.open(path) as im:
             im = im.convert("RGB")
             im.thumbnail((max_dim, max_dim))
-            return list(im.getdata())
+            w, h = im.size
+            return list(im.getdata()), w, h
     except Exception:
         pass
     from . import png_min
 
     rows = png_min.read_png_rgb(path, max_dim=max_dim)
-    if rows is None:
+    if rows is None or not rows[0]:
         return None
-    return [px for row in rows for px in row]
+    return [px for row in rows for px in row], len(rows[0]), len(rows)
 
 
 # --------------------------------------------------------------------------- color math
@@ -76,24 +78,36 @@ def _rgb_to_hue_chroma(r: int, g: int, b: int) -> Tuple[float, float]:
 
 # --------------------------------------------------------------------------- stats
 def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
-    pixels = _load_pixels(path, max_dim=max_dim)
-    if not pixels:
+    loaded = _load_pixels(path, max_dim=max_dim)
+    if not loaded:
         return None
+    pixels, w, h = loaded
     n = len(pixels)
+    # center-weighted key (photographic AE practice): the subject usually sits in the
+    # middle half of the frame, so weighting it 60/40 over the full frame damps sky/floor
+    # albedo contamination of the exposure solve
+    cx0, cx1 = w // 4, (3 * w) // 4
+    cy0, cy1 = h // 4, (3 * h) // 4
     lums: List[float] = []
     log_sum = 0.0
+    log_sum_center, n_center = 0.0, 0
     lab_sum = [0.0, 0.0, 0.0]
     lab_sq = [0.0, 0.0, 0.0]
     hue_hist = [0.0] * HUE_BINS
     mean_rgb = [0.0, 0.0, 0.0]
-    for r, g, b in pixels:
+    for idx, (r, g, b) in enumerate(pixels):
         mean_rgb[0] += r
         mean_rgb[1] += g
         mean_rgb[2] += b
         lin_l = (0.2126 * _srgb_to_linear(r / 255.0)
                  + 0.7152 * _srgb_to_linear(g / 255.0)
                  + 0.0722 * _srgb_to_linear(b / 255.0))
-        log_sum += math.log(max(lin_l, 1e-5))
+        log_l = math.log(max(lin_l, 1e-5))
+        log_sum += log_l
+        x, y = idx % w, idx // w
+        if cx0 <= x < cx1 and cy0 <= y < cy1:
+            log_sum_center += log_l
+            n_center += 1
         lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
         lums.append(lum)
         L, a, bb = _rgb_to_lab(r, g, b)
@@ -115,10 +129,13 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     hue_total = sum(hue_hist)
     lab_mean = [s / n for s in lab_sum]
     lab_std = [math.sqrt(max(0.0, lab_sq[i] / n - lab_mean[i] ** 2)) for i in range(3)]
+    key_full = log_sum / n
+    key_center = log_sum_center / n_center if n_center else key_full
     return {
         "count": n,
         "mean_rgb": [v / n / 255.0 for v in mean_rgb],
-        "log_key": math.exp(log_sum / n),   # geometric mean of LINEAR luminance
+        # geometric mean of LINEAR luminance, 60% center-weighted (blend in log space)
+        "log_key": math.exp(0.6 * key_center + 0.4 * key_full),
         "p": {"5": pct(5), "25": pct(25), "50": pct(50), "75": pct(75), "95": pct(95)},
         "contrast": pct(95) - pct(5),
         "lab_mean": lab_mean,

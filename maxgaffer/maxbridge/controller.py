@@ -61,7 +61,12 @@ class Controller:
     def rig(self, refresh: bool = False):
         if self._rig is None or refresh:
             self._rig = sc.classify_rig()
-            self._baselines = ap.capture_baselines(self._rig)
+            # adopt-only-new into the session: re-scans NEVER overwrite a known baseline,
+            # so a group MaxGaffer previously dimmed to 0 keeps its authored value
+            fresh = ap.capture_baselines(self._rig)
+            if self.session.adopt_baselines(fresh):
+                self.save_session()
+            self._baselines = dict(self.session.baselines)
         return self._rig
 
     def cameras(self) -> List[Dict]:
@@ -184,11 +189,21 @@ class Controller:
         block = self._image_block(e.reference)
         if block is None:
             raise RuntimeError(f"could not read reference image: {e.reference}")
+        messages = [{"role": "user",
+                     "content": [block, omega.text_block(prompts.analyze_user_text())]}]
         reply = self.io(lambda: omega.call(
-            self.cfg.api_key, prompts.ANALYZE_SYSTEM,
-            [{"role": "user", "content": [block, omega.text_block(prompts.analyze_user_text())]}],
+            self.cfg.api_key, prompts.ANALYZE_SYSTEM, messages,
             model=self.cfg.model, max_tokens=2048))
-        semantics = validate_analysis(reply)
+        try:
+            semantics = validate_analysis(reply)
+        except ParseError:   # one strict retry — a wasted run costs far more than a call
+            retry = messages + [
+                {"role": "assistant", "content": reply[:1500]},
+                {"role": "user", "content": "That was not valid JSON. Reply with ONLY the "
+                                            "JSON object, nothing else."}]
+            semantics = validate_analysis(self.io(lambda: omega.call(
+                self.cfg.api_key, prompts.ANALYZE_SYSTEM, retry,
+                model=self.cfg.model, max_tokens=2048)))
         e.semantics = semantics
         self.save_session()
         return semantics
@@ -229,6 +244,10 @@ class Controller:
         locks = set(locks if locks is not None else e.locks)
         run_dir = self._new_run_dir(camera_name)
         log(f"run dir: {run_dir}")
+
+        # snapshot the light as it stands — matches are explorations, not commitments
+        e.pre_match = ap.read_state(rig, self._baselines, cam)
+        self.save_session()
 
         log("analyzing reference…")
         semantics = self.analyze_reference(camera_name)
@@ -302,19 +321,27 @@ class Controller:
         for w in ap.apply_state(rig, self._baselines, state, cam):
             log("⚠ " + w)
 
+    # ------------------------------------------------------------------ restore
+    def restore_pre_match(self, camera_name: str) -> bool:
+        e = self.session.cameras.get(camera_name)
+        if not (e and e.pre_match is not None):
+            return False
+        self.apply_state(e.pre_match, camera_name)
+        return True
+
     # ------------------------------------------------------------------ vantage
     def start_live_link(self) -> Tuple[bool, str]:
         return vt.start_live_link()
 
-    def vantage_render_cameras(
+    def prepare_vantage_jobs(
         self,
         camera_names: List[str],
         out_dir: str,
         on_progress: Callable[[str, str], None],
         use_saved_states: bool = True,
-    ) -> Dict[str, str]:
-        """Per camera: apply its saved lighting state → export .vrscene → vantage_console.
-        The shot-board button: every camera renders under its own matched light."""
+    ) -> List[Dict]:
+        """MAIN-THREAD half: per camera, apply its saved lighting state and export the
+        .vrscene. Raises on export failure (nothing has rendered yet — cheap to abort)."""
         jobs: List[Dict] = []
         export_dir = os.path.join(self._ensure_run_dir("vantage"), _stamp())
         for name in camera_names:
@@ -326,10 +353,16 @@ class Controller:
             scene_file = vt.export_vrscene(
                 os.path.join(export_dir, f"{_safe(name)}.vrscene"), name)
             if scene_file is None:
-                on_progress(name, "export failed")
-                return {name: "export failed (vrayExportVRScene missing or camera not set)"}
+                raise RuntimeError(f"{name}: vrscene export failed "
+                                   "(vrayExportVRScene missing or camera not set)")
             jobs.append({"camera": name, "scene_file": scene_file,
                          "output": os.path.join(out_dir, f"{_safe(name)}.png")})
+        return jobs
+
+    def run_vantage_jobs(self, jobs: List[Dict],
+                         on_progress: Callable[[str, str], None]) -> Dict[str, str]:
+        """Pure-subprocess half — NO pymxs, safe to run on a worker thread so a multi-hour
+        vantage_console batch never freezes Max."""
         return vt.render_stills(jobs, self.cfg.vantage_console,
                                 self.cfg.final_width, self.cfg.final_height, on_progress)
 

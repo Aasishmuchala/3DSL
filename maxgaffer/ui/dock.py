@@ -61,6 +61,13 @@ class _Worker(QtCore.QThread):
             self.failed.emit(str(e))
 
 
+class _ProgressRelay(QtCore.QObject):
+    """Marshals worker-thread progress callbacks onto the main thread — Qt widgets must
+    never be touched from a vantage_console watcher thread."""
+
+    progress = QtCore.Signal(str, str)
+
+
 class MaxGafferDock(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -147,8 +154,10 @@ class MaxGafferDock(QtWidgets.QWidget):
         lm = QtWidgets.QVBoxLayout(g_match)
         opts = QtWidgets.QHBoxLayout()
         self.chk_sweep = QtWidgets.QCheckBox("sun sweep first")
-        self.chk_sweep.setToolTip("Grid-render 8 sun directions and let the model pick "
-                                  "before iterating — the robust solve for sun azimuth.")
+        self.chk_sweep.setChecked(True)   # a wrong sun direction wastes the whole run;
+        self.chk_sweep.setToolTip(        # 8 low-res renders are cheap insurance
+            "Grid-render 8 sun directions and let the model pick before iterating — the "
+            "robust solve for sun azimuth. Uncheck on very heavy scenes to save renders.")
         opts.addWidget(self.chk_sweep)
         opts.addWidget(QtWidgets.QLabel("iterations"))
         self.spin_iters = QtWidgets.QSpinBox()
@@ -189,6 +198,11 @@ class MaxGafferDock(QtWidgets.QWidget):
         btn_open_run = QtWidgets.QPushButton("Open run folder")
         btn_open_run.clicked.connect(self._open_run_dir)
         lrow.addWidget(btn_open_run)
+        btn_restore = QtWidgets.QPushButton("Restore pre-match light")
+        btn_restore.setToolTip("Put the lighting back exactly as it was before this "
+                               "camera's last match run (snapshotted automatically).")
+        btn_restore.clicked.connect(self._restore_pre_match)
+        lrow.addWidget(btn_restore)
         lrow.addStretch(1)
         lm.addLayout(lrow)
         right.addWidget(g_match)
@@ -284,6 +298,9 @@ class MaxGafferDock(QtWidgets.QWidget):
     def _on_camera_selected(self, item, _prev):
         if item is None:
             return
+        if self._busy:   # a match/batch is mid-flight — applying a saved state now would
+            self._log("busy — camera switch ignored until the current run finishes")
+            return       # yank the rig out from under the loop
         name = item.text(0)
         try:
             for w in self.ctrl.select_camera(name):
@@ -309,7 +326,9 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not path:
             return
         self.ctrl.session.set_reference(cam, path)
-        self.ctrl.save_session()
+        if not self.ctrl.save_session():
+            self._log("⚠ scene not saved yet — bindings live in memory only until you "
+                      "save the .max file")
         self._show_reference(cam)
         self.refresh_cameras()
 
@@ -447,6 +466,16 @@ class MaxGafferDock(QtWidgets.QWidget):
         d = self.ctrl._run_dir or cfgmod.sessions_dir()
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(d))
 
+    def _restore_pre_match(self):
+        if self._busy:
+            return
+        cam = self._current_camera()
+        if cam and self.ctrl.restore_pre_match(cam):
+            self._log(f"restored pre-match lighting for {cam}")
+            self.rebuild_rig_controls()
+        else:
+            self._log("no pre-match snapshot for this camera yet")
+
     # ================================================================= vantage
     def _start_live_link(self):
         ok, how = self.ctrl.start_live_link()
@@ -467,8 +496,16 @@ class MaxGafferDock(QtWidgets.QWidget):
             return
         self._busy = True
         try:
-            results = self.ctrl.vantage_render_cameras(
+            # main-thread half: apply states + export vrscenes (pymxs)
+            jobs = self.ctrl.prepare_vantage_jobs(
                 cams, out_dir, on_progress=lambda c, s: self._log(f"vantage {c}: {s}"))
+            # worker half: the vantage_console batch is pure subprocess — run it off-main
+            # so a multi-hour batch never freezes Max; progress marshals back via signal
+            relay = _ProgressRelay()
+            relay.progress.connect(lambda c, s: self._log(f"vantage {c}: {s}"))
+            results = self._run_blocking_io(
+                lambda: self.ctrl.run_vantage_jobs(
+                    jobs, on_progress=lambda c, s: relay.progress.emit(c, s)))
             for cam, status in results.items():
                 self._log(f"{'✓' if status == 'ok' else '✗'} {cam}: {status}")
         except Exception as e:  # noqa: BLE001

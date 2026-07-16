@@ -96,7 +96,9 @@ def test_stats_agree_between_engines(tmp_path):
 
     def stdlib_only(p, max_dim=256):
         rows = png_min.read_png_rgb(p, max_dim=max_dim)
-        return None if rows is None else [px for row in rows for px in row]
+        if rows is None or not rows[0]:
+            return None
+        return [px for row in rows for px in row], len(rows[0]), len(rows)
 
     metrics._load_pixels = stdlib_only
     try:

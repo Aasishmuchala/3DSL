@@ -262,7 +262,11 @@ def read_dome_rotation(dome) -> float:
 
 def write_dome_rotation(dome, degrees_: float) -> str:
     """Prefer the HDRI texmap's horizontal-rotation spinner; fall back to spinning the node
-    around world Z. Returns which path was used (for the log/verify checklist)."""
+    about WORLD Z at its own pivot. Returns which path was used (log/verify checklist).
+
+    The fallback composes W' = W · T(−p) · Rz(Δ) · T(p) explicitly instead of rt.rotate(),
+    whose working coordsys is context-dependent — a dome that a previous artist tilted
+    would otherwise spin around the wrong axis."""
     tex = get_prop(dome, ("texmap",))
     if tex is not None:
         used = set_prop(tex, DOME_TEX_ROT, float(degrees_ % 360.0))
@@ -272,7 +276,11 @@ def write_dome_rotation(dome, degrees_: float) -> str:
         rt = _rt()
         current = read_dome_rotation(dome)
         delta = (degrees_ - current + 180.0) % 360.0 - 180.0
-        rt.rotate(dome, rt.eulerAngles(0.0, 0.0, float(delta)))
+        tm = dome.transform
+        p = tm.translationpart
+        neg_p = rt.Point3(-float(p.x), -float(p.y), -float(p.z))
+        dome.transform = (tm * rt.transMatrix(neg_p)
+                          * rt.rotateZMatrix(float(delta)) * rt.transMatrix(p))
         return "node_z_rotation"
     except Exception:
         return "failed"

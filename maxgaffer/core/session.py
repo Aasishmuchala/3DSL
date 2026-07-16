@@ -36,6 +36,7 @@ class CameraEntry:
     matched_at: str = ""
     locks: Set[str] = field(default_factory=set)
     semantics: Dict = field(default_factory=dict)   # cached ANALYZE result for the reference
+    pre_match: Optional[LightingState] = None       # the light BEFORE the last match run
 
     def to_dict(self) -> Dict:
         return {
@@ -45,11 +46,13 @@ class CameraEntry:
             "matched_at": self.matched_at,
             "locks": sorted(self.locks),
             "semantics": self.semantics,
+            "pre_match": self.pre_match.to_dict() if self.pre_match else None,
         }
 
     @classmethod
     def from_dict(cls, d: Dict) -> "CameraEntry":
         state = d.get("state")
+        pre = d.get("pre_match")
         return cls(
             reference=str(d.get("reference") or ""),
             state=LightingState.from_dict(state) if isinstance(state, dict) else None,
@@ -57,6 +60,7 @@ class CameraEntry:
             matched_at=str(d.get("matched_at") or ""),
             locks=set(x for x in (d.get("locks") or []) if isinstance(x, str)),
             semantics=d.get("semantics") if isinstance(d.get("semantics"), dict) else {},
+            pre_match=LightingState.from_dict(pre) if isinstance(pre, dict) else None,
         )
 
 
@@ -65,7 +69,30 @@ class Session:
         self.path = path
         self.cameras: Dict[str, CameraEntry] = {}
         self.settings: Dict = {"apply_on_select": True}
+        # AUTHORED light multipliers, keyed by light NAME, adopted once and never
+        # overwritten — group factors multiply these. Persisting them is what prevents the
+        # baseline-poisoning bug: re-capturing after MaxGaffer set a group to 0 would record
+        # base=0 and kill the group forever (0 × factor). Names survive Max restarts;
+        # anim handles do not.
+        self.baselines: Dict[str, float] = {}
         self._now = now_fn or _iso_now
+
+    def adopt_baselines(self, fresh: Dict[str, float]) -> List[str]:
+        """Adopt baselines for lights we have never seen; NEVER overwrite known ones.
+        Returns the names actually adopted."""
+        added: List[str] = []
+        for name, value in (fresh or {}).items():
+            if name not in self.baselines:
+                try:
+                    self.baselines[str(name)] = float(value)
+                    added.append(str(name))
+                except (TypeError, ValueError):
+                    continue
+        return added
+
+    def forget_baseline(self, name: str) -> None:
+        """Explicit re-adopt hook (user re-authored a light and wants the new value)."""
+        self.baselines.pop(name, None)
 
     # ------------------------------------------------------------------ persistence
     @classmethod
@@ -83,6 +110,8 @@ class Session:
                 s.cameras[str(name)] = CameraEntry.from_dict(entry)
         if isinstance(d.get("settings"), dict):
             s.settings.update(d["settings"])
+        if isinstance(d.get("baselines"), dict):
+            s.adopt_baselines(d["baselines"])
         return s
 
     def save(self) -> bool:
@@ -92,6 +121,7 @@ class Session:
             "version": FORMAT_VERSION,
             "cameras": {n: e.to_dict() for n, e in self.cameras.items()},
             "settings": self.settings,
+            "baselines": self.baselines,
         }
         try:
             tmp = self.path + ".tmp"

@@ -177,17 +177,25 @@ def main() -> int:
     def img(path):
         return omega.image_block_from_file(path)
 
-    # ---------- ① ANALYZE
-    if live:
-        reply = omega.call(key, prompts.ANALYZE_SYSTEM,
-                           [{"role": "user", "content": [
-                               img(ref_path), omega.text_block(prompts.analyze_user_text())]}],
-                           max_tokens=2048)
-    else:
-        reply = scripted.analyze()
-    semantics = parse.validate_analysis(reply)
-    print(f"\n① analyze: {semantics['time_of_day']}, bearing "
-          f"{semantics['sun_bearing_deg']:+.0f}°, band {semantics['sun_altitude_band']}, "
+    # ---------- ① ANALYZE (3-sample self-consistency, as the controller now runs it)
+    from maxgaffer.core.consensus import consolidate_analyses
+
+    samples = []
+    for _ in range(3 if live else 1):
+        reply = (omega.call(key, prompts.ANALYZE_SYSTEM,
+                            [{"role": "user", "content": [
+                                img(ref_path),
+                                omega.text_block(prompts.analyze_user_text())]}],
+                            max_tokens=2048) if live else scripted.analyze())
+        try:
+            samples.append(parse.validate_analysis(reply))
+        except parse.ParseError:
+            continue
+    semantics = consolidate_analyses(samples)
+    agreement = semantics.pop("consensus_agreement", 1.0)
+    print(f"\n① analyze ×{len(samples)} (agreement {agreement:.0%}): "
+          f"{semantics['time_of_day']}, bearing {semantics['sun_bearing_deg']:+.0f}°, "
+          f"band {semantics['sun_altitude_band']}, "
           f"wb~{semantics['wb_kelvin_estimate']:.0f}K")
 
     # ---------- ② RULES first guess
@@ -226,7 +234,8 @@ def main() -> int:
         return omega.call(key, prompts.SWEEP_SYSTEM,
                           [{"role": "user", "content": content}], max_tokens=1024)
 
-    az, hint, _why = run_sun_sweep(start, [0.0, 90.0, 180.0, 270.0], hooks, sweep_pick)
+    az, hint, _why = run_sun_sweep(start, [0.0, 90.0, 180.0, 270.0], hooks, sweep_pick,
+                                   ref_stats=ref_stats)
     if az is not None:
         start.set("sun.azimuth_deg", az)
         if hint != "na":

@@ -805,6 +805,14 @@ class ChangeReportDialog(QtWidgets.QDialog):
             top.setExpanded(True)
 
         pr = plan_report or {"changes": [], "created": [], "warnings": []}
+        if pr.get("effect"):
+            eff = pr["effect"]
+            worse = eff["after"] < eff["before"] - 5.0
+            eff_lbl = QtWidgets.QLabel(
+                f"plan effect (measured): critic {eff['before']:.1f} → {eff['after']:.1f}"
+                + ("   ⚠ worse — one Ctrl+Z reverts the plan" if worse else ""))
+            eff_lbl.setStyleSheet(f"color:{ERR};" if worse else f"color:{OK};")
+            lay.addWidget(eff_lbl)
         add_group("Plan — values changed", pr["changes"], lambda c: [
             f"{c['target']} · {c['prop']}", str(c["before"]), str(c["after"]),
             c.get("why", "")])

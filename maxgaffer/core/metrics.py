@@ -95,6 +95,11 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     lab_sq = [0.0, 0.0, 0.0]
     hue_hist = [0.0] * HUE_BINS
     mean_rgb = [0.0, 0.0, 0.0]
+    # 3×3 luminance grid — WHERE the light lives. Unlike content-bound structure metrics,
+    # the bright-third pattern transfers across different scenes lit the same way (sun
+    # camera-left brightens the left cells of ref AND render) — the critic's direction eye.
+    grid_sum = [0.0] * 9
+    grid_n = [0] * 9
     for idx, (r, g, b) in enumerate(pixels):
         mean_rgb[0] += r
         mean_rgb[1] += g
@@ -110,6 +115,9 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
             n_center += 1
         lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
         lums.append(lum)
+        cell = min(2, x * 3 // max(1, w)) + 3 * min(2, y * 3 // max(1, h))
+        grid_sum[cell] += lum
+        grid_n[cell] += 1
         L, a, bb = _rgb_to_lab(r, g, b)
         for i, v in enumerate((L, a, bb)):
             lab_sum[i] += v
@@ -117,6 +125,18 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         hue, chroma = _rgb_to_hue_chroma(r, g, b)
         if chroma > 0.02:  # near-neutrals carry no hue information
             hue_hist[int(hue / 360.0 * HUE_BINS) % HUE_BINS] += chroma
+    # highlight chromaticity — the top luminance quartile carries the ILLUMINANT's color
+    # (white-patch assumption), far less contaminated by scene albedo than the full mean
+    hi_thresh = sorted(lums)[max(0, int(0.75 * len(lums)) - 1)]
+    hi_sum = [0.0, 0.0, 0.0]
+    hi_n = 0
+    for r, g, b in pixels:
+        if (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0 >= hi_thresh:
+            L, a, bb = _rgb_to_lab(r, g, b)
+            hi_sum[0] += L
+            hi_sum[1] += a
+            hi_sum[2] += bb
+            hi_n += 1
     lums.sort()
 
     def pct(p: float) -> float:
@@ -131,9 +151,13 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     lab_std = [math.sqrt(max(0.0, lab_sq[i] / n - lab_mean[i] ** 2)) for i in range(3)]
     key_full = log_sum / n
     key_center = log_sum_center / n_center if n_center else key_full
+    grid_mean = sum(grid_sum) / max(1, sum(grid_n)) or 1e-6
+    grid = [(grid_sum[i] / grid_n[i] - grid_mean) if grid_n[i] else 0.0 for i in range(9)]
     return {
         "count": n,
         "mean_rgb": [v / n / 255.0 for v in mean_rgb],
+        "grid": [round(g, 5) for g in grid],   # mean-centered 3×3 luminance pattern
+        "lab_mean_hi": ([s / hi_n for s in hi_sum] if hi_n else lab_mean),
         # geometric mean of LINEAR luminance, 60% center-weighted (blend in log space)
         "log_key": math.exp(0.6 * key_center + 0.4 * key_full),
         "p": {"5": pct(5), "25": pct(25), "50": pct(50), "75": pct(75), "95": pct(95)},

@@ -20,7 +20,7 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..core import metrics, omega, planner, prompts, rules, scenedigest
+from ..core import consensus, critic, metrics, omega, planner, prompts, rules, scenedigest
 from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
@@ -218,19 +218,33 @@ class Controller:
             raise RuntimeError(f"could not read reference image: {e.reference}")
         messages = [{"role": "user",
                      "content": [block, omega.text_block(prompts.analyze_user_text())]}]
-        reply = self.io(lambda: omega.call(
-            self.cfg.api_key, prompts.ANALYZE_SYSTEM, messages,
-            model=self.cfg.model, max_tokens=2048))
-        try:
-            semantics = validate_analysis(reply)
-        except ParseError:   # one strict retry — a wasted run costs far more than a call
+        # self-consistency: N independent reads, consolidated (majority/median/circular
+        # mean) — live evidence showed single samples reading the same ref as golden hour
+        # OR midday, and a wrong read poisons the whole run
+        samples = []
+        n = max(1, int(self.cfg.analyze_samples))
+        last_reply = ""
+        for _ in range(n):
+            last_reply = self.io(lambda: omega.call(
+                self.cfg.api_key, prompts.ANALYZE_SYSTEM, messages,
+                model=self.cfg.model, max_tokens=2048))
+            try:
+                samples.append(validate_analysis(last_reply))
+            except ParseError:
+                continue
+        if not samples:   # every sample was junk — one strict retry, then give up loudly
             retry = messages + [
-                {"role": "assistant", "content": reply[:1500]},
+                {"role": "assistant", "content": last_reply[:1500]},
                 {"role": "user", "content": "That was not valid JSON. Reply with ONLY the "
                                             "JSON object, nothing else."}]
-            semantics = validate_analysis(self.io(lambda: omega.call(
+            samples.append(validate_analysis(self.io(lambda: omega.call(
                 self.cfg.api_key, prompts.ANALYZE_SYSTEM, retry,
-                model=self.cfg.model, max_tokens=2048)))
+                model=self.cfg.model, max_tokens=2048))))
+        semantics = consensus.consolidate_analyses(samples)
+        agreement = semantics.pop("consensus_agreement", 1.0)
+        if len(samples) > 1 and agreement < 1.0:
+            # keep it out of the cached dict but tell the human the read was contested
+            self._last_analyze_agreement = agreement
         e.semantics = semantics
         self.save_session()
         return semantics
@@ -249,7 +263,7 @@ class Controller:
             content.append(omega.text_block(prompts.deltas_user_text(
                 ctx["state_table"], ctx["semantics"], ctx["score_history"],
                 ctx["analytic_applied"], ctx["iteration"], ctx["max_iterations"],
-                ctx.get("rig_notes", ""))))
+                ctx.get("rig_notes", ""), ctx.get("param_history", ""))))
             return self.io(lambda: omega.call(
                 self.cfg.api_key, prompts.DELTAS_SYSTEM,
                 [{"role": "user", "content": content}],
@@ -299,11 +313,31 @@ class Controller:
             log("plan rejected: " + r)
         return ops, planner.describe_plan(ops), meta, raw
 
+    def probe_score(self, camera_name: str, tag: str) -> Optional[float]:
+        """One loop-res render of the current scene scored against the camera's reference
+        — the cheap 'did that help?' measurement."""
+        e = self.session.cameras.get(camera_name)
+        if not (e and e.reference):
+            return None
+        ref = self.ref_stats(e.reference)
+        cam = sc.get_camera(camera_name)
+        if ref is None or cam is None:
+            return None
+        path = rd.render_frame(
+            cam, os.path.join(self._ensure_run_dir(_safe(camera_name)), f"probe_{tag}.png"),
+            self.cfg.loop_width, self.cfg.loop_height)
+        cur = self.stats_for(path) if path else None
+        if cur is None:
+            return None
+        return critic.score(ref, cur, self.cfg.critic_weights or None).score
+
     def execute_plan(self, ops, camera_name: str,
-                     log: Callable[[str], None]) -> Dict:
+                     log: Callable[[str], None], measure: bool = True) -> Dict:
         """Execute a validated plan (one undo record; MG_ layer for created lights) and
-        return the before/after change report. Rig is re-classified after — new lights
-        join the dimmer boards immediately."""
+        return the before/after change report — including the plan's MEASURED effect
+        (critic score before vs after, one probe render each side). Rig re-classified
+        after so new lights join the dimmer boards immediately."""
+        before_score = self.probe_score(camera_name, "preplan") if measure else None
         cam = sc.get_camera(camera_name)
         report = ex.execute_plan(ops, cam)
         for c in report["changes"]:
@@ -313,6 +347,13 @@ class Controller:
         for w in report["warnings"]:
             log("  ⚠ " + w)
         self.rig(refresh=True)
+        if measure and before_score is not None:
+            after_score = self.probe_score(camera_name, "postplan")
+            if after_score is not None:
+                report["effect"] = {"before": before_score, "after": after_score}
+                log(f"plan effect: critic {before_score:.1f} → {after_score:.1f}"
+                    + ("  ⚠ the plan made the match WORSE — one Ctrl+Z reverts it"
+                       if after_score < before_score - 5.0 else ""))
         return report
 
     def state_change_rows(self, camera_name: str) -> List[Dict]:
@@ -407,11 +448,18 @@ class Controller:
             should_cancel=should_cancel,
         )
 
+        agreement = getattr(self, "_last_analyze_agreement", None)
+        if agreement is not None and agreement < 1.0:
+            log(f"⚠ analyze samples disagreed (agreement {agreement:.0%}) — consensus "
+                "used; consider a cleaner reference if the match fights you")
+            self._last_analyze_agreement = None
+
         if do_sweep and rig.get("sun") is not None and "sun.azimuth_deg" not in locks:
             log(f"sun sweep: {self.cfg.sweep_count} directions…")
             az, alt_hint, _why = run_sun_sweep(
                 start, rules.sweep_azimuths(self.cfg.sweep_count), hooks,
-                llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs))
+                llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs),
+                ref_stats=ref_stats)
             if az is not None:
                 start.set("sun.azimuth_deg", az)
                 # the hint was judged against real renders of THIS scene — trust it over

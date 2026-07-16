@@ -84,11 +84,15 @@ def deltas_user_text(
     iteration: int,
     max_iterations: int,
     rig_notes: str = "",
+    param_history: str = "",
 ) -> str:
     hist = (" · ".join(f"iter{i}={s:.1f}" for i, s in score_history)
             if score_history else "no scores yet (metrics unavailable — judge visually)")
     analytic = (json.dumps({k: round(v, 2) for k, v in analytic_applied.items()})
                 if analytic_applied else "none")
+    trajectory = (f"Your parameter trajectory so far (do NOT oscillate — if a value has "
+                  f"ping-ponged, hold it and change something else):\n{param_history}\n"
+                  if param_history else "")
     return f"""Image 1 = REFERENCE. Image 2 = CURRENT RENDER (iteration {iteration} of {max_iterations}).
 
 Reference lighting analysis (from the scout pass):
@@ -99,7 +103,7 @@ Current rig parameter table:
 
 {('Rig notes: ' + rig_notes) if rig_notes else ''}
 Tonal-critic score history (0-100, higher = closer): {hist}
-Analytic solver already applied this iteration (do NOT counteract): {analytic}
+{trajectory}Analytic solver already applied this iteration (do NOT counteract): {analytic}
 
 Propose the next changes. Reply with only the JSON object."""
 

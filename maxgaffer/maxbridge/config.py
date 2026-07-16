@@ -40,6 +40,7 @@ class Config:
     final_height: int = 1080
     max_iterations: int = 5
     target_score: float = 82.0
+    analyze_samples: int = 3                 # ANALYZE self-consistency (1 = single-shot)
     sweep_count: int = 8
     keep_runs: int = 10                      # run folders kept per camera (0 = keep all)
     draft_sampler: bool = False              # opt-in: draft render settings during matches

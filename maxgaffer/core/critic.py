@@ -22,11 +22,12 @@ from typing import Dict
 from .metrics import cosine, hist_emd
 
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    "key": 0.22,
-    "envelope": 0.18,
-    "histogram": 0.20,
-    "color": 0.25,
-    "hue": 0.15,
+    "key": 0.19,
+    "envelope": 0.15,
+    "histogram": 0.17,
+    "color": 0.21,
+    "hue": 0.13,
+    "direction": 0.15,   # 3×3 luminance-grid cosine — WHERE the light lives
 }
 
 
@@ -74,5 +75,10 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
     s_hue = max(0.0, cosine(ref.get("hue_hist", []), cur.get("hue_hist", [])))
 
     comps = {"key": s_key, "envelope": s_env, "histogram": s_hist, "color": s_col, "hue": s_hue}
+    g_ref, g_cur = ref.get("grid"), cur.get("grid")
+    if g_ref and g_cur and any(abs(v) > 1e-6 for v in g_ref):
+        comps["direction"] = max(0.0, (cosine(g_ref, g_cur) + 1.0) / 2.0)
+    # only weigh what was measurable — old stats without a grid renormalize cleanly
+    total_w = sum(w[k] for k in comps) or 1.0
     total = sum(w[k] * comps[k] for k in comps) / total_w
     return Verdict(score=round(100.0 * total, 2), components=comps)

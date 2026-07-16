@@ -45,9 +45,23 @@ def solve_ev(ref_stats: Dict, cur_stats: Dict, current_ev: float) -> Optional[fl
 
 def solve_wb(ref_stats: Dict, cur_stats: Dict, current_kelvin: float,
              kelvin_per_b: float = WB_KELVIN_PER_B) -> Optional[float]:
-    """New WB kelvin nudging the render's blue-yellow balance toward the reference."""
-    b_ref = float(ref_stats.get("lab_mean", [0, 0, 0])[2])
-    b_cur = float(cur_stats.get("lab_mean", [0, 0, 0])[2])
+    """New WB kelvin nudging the render's blue-yellow balance toward the reference.
+
+    Prefers HIGHLIGHT chromaticity (top luminance quartile — the white-patch assumption:
+    highlights carry the illuminant, the full mean carries the furniture). This is the
+    direct counter to the albedo trap; falls back to full-frame means on old stats."""
+    def b_of(stats: Dict) -> float:
+        hi = stats.get("lab_mean_hi")
+        src = hi if isinstance(hi, (list, tuple)) and len(hi) == 3 else stats.get(
+            "lab_mean", [0, 0, 0])
+        return float(src[2])
+
+    use_hi = ("lab_mean_hi" in ref_stats) == ("lab_mean_hi" in cur_stats)
+    if use_hi:
+        b_ref, b_cur = b_of(ref_stats), b_of(cur_stats)
+    else:   # never compare a highlight mean against a full mean — different quantities
+        b_ref = float(ref_stats.get("lab_mean", [0, 0, 0])[2])
+        b_cur = float(cur_stats.get("lab_mean", [0, 0, 0])[2])
     db = b_ref - b_cur
     if abs(db) < WB_DEADBAND_B:
         return None

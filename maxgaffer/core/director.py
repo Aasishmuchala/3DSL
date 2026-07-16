@@ -211,6 +211,15 @@ def run_match(
             stop_reason = "cancelled"
             records.append(rec)
             break
+        # per-param trajectory — the model sees its own oscillation (live sim showed
+        # altitude ping-ponging 6→-1→6 when each iteration judged in isolation)
+        param_history: Dict[str, List[float]] = {}
+        for r in records:
+            for k, v in list(r.analytic_changes.items()) + list(r.llm_accepted.items()):
+                param_history.setdefault(k, []).append(round(v, 2))
+        history_txt = "\n".join(
+            f"  {k}: {' → '.join(str(x) for x in vs[-5:])}"
+            for k, vs in sorted(param_history.items()) if len(vs) >= 2)
         ctx = {
             "iteration": i,
             "max_iterations": cfg.max_iterations,
@@ -218,6 +227,7 @@ def run_match(
             "semantics": semantics,
             "score_history": score_history,
             "analytic_applied": rec.analytic_changes,
+            "param_history": history_txt,
             "render_path": path,
             "rig_notes": rig_notes,
             "max_changes": cfg.max_changes,
@@ -298,16 +308,21 @@ def run_sun_sweep(
     azimuths: List[float],
     hooks: Hooks,
     llm_pick: Callable[[List[str], List[float]], str],
+    ref_stats: Optional[Dict] = None,
 ) -> Tuple[Optional[float], str, str]:
     """Grid-solve the sun direction: render one low-res frame per azimuth, let the LLM do
-    multiple-choice (estimation is hard, comparison is easy).
-    Returns (azimuth | None, altitude_hint, why) — the hint comes from the same comparison
-    (the model sees real renders of THIS scene against the reference) so the caller should
-    prefer it over the ANALYZE pass's band when they disagree."""
+    multiple-choice (estimation is hard, comparison is easy) — CROSS-CHECKED by the
+    deterministic direction metric (3×3 luminance-grid cosine vs the reference) when
+    ``ref_stats`` carries a grid. A clear metric winner overrides an LLM pick it beats by
+    a margin: two independent judges beat one on the system's weakest call.
+    Returns (azimuth | None, altitude_hint, why)."""
+    from .metrics import cosine
     from .parse import validate_sweep
 
     paths: List[str] = []
     kept: List[float] = []
+    dir_scores: List[Optional[float]] = []
+    ref_grid = (ref_stats or {}).get("grid")
     for az in azimuths:
         if hooks.should_cancel():
             return None, "na", "cancelled"
@@ -318,6 +333,12 @@ def run_sun_sweep(
         if path:
             paths.append(path)
             kept.append(az)
+            score = None
+            if ref_grid and any(abs(v) > 1e-6 for v in ref_grid):
+                st = hooks.stats(path)
+                if st and st.get("grid"):
+                    score = (cosine(ref_grid, st["grid"]) + 1.0) / 2.0
+            dir_scores.append(score)
         else:
             hooks.log(f"sweep: render failed at azimuth {az:.0f}° — skipping")
     if len(paths) < 2:
@@ -326,6 +347,14 @@ def run_sun_sweep(
         picked = validate_sweep(llm_pick(paths, kept), len(paths))
     except ParseError as e:
         return None, "na", f"sweep reply unusable: {e}"
-    az = kept[picked["best_index"]]
+    idx = picked["best_index"]
+    if all(s is not None for s in dir_scores):
+        metric_idx = max(range(len(dir_scores)), key=lambda i: dir_scores[i])
+        if metric_idx != idx and dir_scores[metric_idx] - dir_scores[idx] > 0.15:
+            hooks.log(f"sweep: direction metric overrides — {kept[metric_idx]:.0f}° "
+                      f"(pattern {dir_scores[metric_idx]:.2f}) beats the pick of "
+                      f"{kept[idx]:.0f}° ({dir_scores[idx]:.2f})")
+            idx = metric_idx
+    az = kept[idx]
     hooks.log(f"sweep: azimuth {az:.0f}° — {picked['why']}")
     return az, picked["altitude_hint"], picked["why"]

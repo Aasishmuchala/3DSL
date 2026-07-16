@@ -1054,11 +1054,11 @@ def show_dock():
         dock.setWidget(widget)
         parent.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
         dock.setFloating(True)
-        dock.resize(940, 1080)
+        dock.resize(1040, 1100)
         dock.show()
         _dock_instance = widget
     else:  # dev fallback: plain window
         _dock_instance = MaxGafferDock()
-        _dock_instance.resize(940, 1080)
+        _dock_instance.resize(1040, 1100)
         _dock_instance.show()
     return _dock_instance

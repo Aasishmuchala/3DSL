@@ -157,8 +157,10 @@ class MaxGafferDock(QtWidgets.QWidget):
 
         # reference group — reference vs latest match, side by side
         g_ref = QtWidgets.QGroupBox("REFERENCE  ·  LATEST MATCH")
-        lr = QtWidgets.QHBoxLayout(g_ref)
-        lr.setSpacing(14)
+        lr = QtWidgets.QVBoxLayout(g_ref)
+        lr.setSpacing(10)
+        thumbs = QtWidgets.QHBoxLayout()
+        thumbs.setSpacing(14)
 
         def _thumb(placeholder):
             t = QtWidgets.QLabel(placeholder)
@@ -169,19 +171,21 @@ class MaxGafferDock(QtWidgets.QWidget):
             return t
 
         self.ref_thumb = _thumb("no reference")
-        lr.addWidget(self.ref_thumb)
+        thumbs.addWidget(self.ref_thumb)
         self.match_thumb = _thumb("no match yet")
-        lr.addWidget(self.match_thumb)
-        ref_col = QtWidgets.QVBoxLayout()
-        ref_col.setSpacing(10)
+        thumbs.addWidget(self.match_thumb)
+        thumbs.addStretch(1)
+        lr.addLayout(thumbs)
+        info_row = QtWidgets.QHBoxLayout()
+        info_row.setSpacing(12)
         btn_ref = QtWidgets.QPushButton("Load / swap reference…")
         btn_ref.clicked.connect(self._pick_reference)
-        ref_col.addWidget(btn_ref)
+        info_row.addWidget(btn_ref)
         self.lbl_ref_info = QtWidgets.QLabel("")
         self.lbl_ref_info.setObjectName("dim")
         self.lbl_ref_info.setWordWrap(True)
-        ref_col.addWidget(self.lbl_ref_info, 1)
-        lr.addLayout(ref_col, 1)
+        info_row.addWidget(self.lbl_ref_info, 1)
+        lr.addLayout(info_row)
         right.addWidget(g_ref)
 
         # match group
@@ -200,6 +204,20 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.chk_auto_exec.setChecked(bool(self.cfg.auto_execute_plan))
         self.chk_auto_exec.setToolTip("Skip the preview dialog and execute immediately.")
         prow.addWidget(self.chk_auto_exec)
+        self.chk_deep = QtWidgets.QCheckBox("deep match → 99")
+        self.chk_deep.setToolTip(
+            "Hero-shot mode: up to 10 iterations targeting 99, then an LLM-free "
+            "coordinate-descent polish that keeps rendering fine nudges until no move "
+            "improves the score — a proven optimum. If 99 isn't reachable, the report says "
+            "the remaining gap is content, not lighting. Costs ~20-40 extra loop renders.")
+        prow.addWidget(self.chk_deep)
+        self.chk_draft = QtWidgets.QCheckBox("draft sampler")
+        self.chk_draft.setChecked(bool(self.cfg.draft_sampler))
+        self.chk_draft.setToolTip(
+            "OPT-IN: apply draft sampler settings (noise threshold / subdivs / time cap) "
+            "during the match, restored automatically afterwards — crash-safe snapshot on "
+            "disk. Never touches GI or lights.")
+        prow.addWidget(self.chk_draft)
         prow.addStretch(1)
         lm.addLayout(prow)
         opts = QtWidgets.QHBoxLayout()
@@ -219,20 +237,6 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.spin_target.setRange(50.0, 100.0)
         self.spin_target.setValue(float(self.cfg.target_score))
         opts.addWidget(self.spin_target)
-        self.chk_deep = QtWidgets.QCheckBox("deep match → 99")
-        self.chk_deep.setToolTip(
-            "Hero-shot mode: up to 10 iterations targeting 99, then an LLM-free "
-            "coordinate-descent polish that keeps rendering fine nudges until no move "
-            "improves the score — a proven optimum. If 99 isn't reachable, the report says "
-            "the remaining gap is content, not lighting. Costs ~20-40 extra loop renders.")
-        opts.addWidget(self.chk_deep)
-        self.chk_draft = QtWidgets.QCheckBox("draft sampler")
-        self.chk_draft.setChecked(bool(self.cfg.draft_sampler))
-        self.chk_draft.setToolTip(
-            "OPT-IN: apply draft sampler settings (noise threshold / subdivs / time cap) "
-            "during the match, restored automatically afterwards — crash-safe snapshot on "
-            "disk. Never touches GI or lights.")
-        opts.addWidget(self.chk_draft)
         opts.addStretch(1)
         lm.addLayout(opts)
 
@@ -291,16 +295,15 @@ class MaxGafferDock(QtWidgets.QWidget):
             "\"too warm, shadows too soft\"")
         self.ed_note.returnPressed.connect(self._start_refine)
         lref.addWidget(self.ed_note)
-        chips = QtWidgets.QHBoxLayout()
+        chips = QtWidgets.QGridLayout()
         chips.setSpacing(6)
-        for label in ("too bright", "too dark", "too warm", "too cool",
-                      "harder shadows", "softer shadows", "sun more left",
-                      "sun more right"):
+        for i, label in enumerate(("too bright", "too dark", "too warm", "too cool",
+                                   "harder shadows", "softer shadows", "sun more left",
+                                   "sun more right")):
             b = QtWidgets.QPushButton(label)
             b.setObjectName("chip")
             b.clicked.connect(lambda _c=False, t=label: self._chip_note(t))
-            chips.addWidget(b)
-        chips.addStretch(1)
+            chips.addWidget(b, i // 4, i % 4)
         lref.addLayout(chips)
         rrow = QtWidgets.QHBoxLayout()
         self.btn_refine = QtWidgets.QPushButton("REFINE  ·  3-LENS ENSEMBLE")

@@ -23,37 +23,58 @@ from ..core.omega import OmegaError, ping
 from ..maxbridge import config as cfgmod
 from ..maxbridge.controller import Controller
 
-ACCENT = "#c6bfff"
-BG = "#0e0e12"
-PANEL = "#16161c"
-ERR = "#ff6b6b"
-OK = "#7ddba3"
+ACCENT = "#f2f2f2"          # monochrome: the only "color" is contrast
+BG = "#161616"
+PANEL = "#1b1b1b"
+INSET = "#131313"
+ERR = "#d9d9d9"
+OK = "#f2f2f2"
+DIM = "#8f8f8f"
+
+_RAISED = ("border-top:1px solid rgba(255,255,255,0.07);"
+           "border-left:1px solid rgba(255,255,255,0.04);"
+           "border-bottom:1px solid #060606;border-right:1px solid #0a0a0a;")
+_SUNK = ("border-top:1px solid #070707;border-left:1px solid #0a0a0a;"
+         "border-bottom:1px solid rgba(255,255,255,0.06);"
+         "border-right:1px solid rgba(255,255,255,0.04);")
 
 STYLE = (
-    f"QWidget{{background:{BG};color:#eceaf4;font-family:Inter,'Segoe UI';font-size:13px;}}"
-    f"QPushButton{{background:{PANEL};border:1px solid #2b2b36;padding:9px 14px;"
-    f"border-radius:8px;}}"
-    f"QPushButton:hover{{border-color:{ACCENT};color:#ffffff;}}"
-    f"QPushButton:disabled{{color:#5a5a66;border-color:#20202a;}}"
-    f"QPushButton#primary{{background:{ACCENT};color:#12121a;font-weight:600;"
-    f"min-height:26px;letter-spacing:1px;}}"
-    f"QPushButton#danger{{border-color:{ERR};color:{ERR};}}"
-    f"QPushButton#chip{{padding:5px 10px;border-radius:12px;color:#b9b4d6;font-size:12px;}}"
-    f"QLineEdit,QComboBox,QPlainTextEdit,QTextEdit,QTreeWidget,QListWidget,QSpinBox,"
-    f"QDoubleSpinBox"
-    f"{{background:{PANEL};border:1px solid #2b2b36;border-radius:8px;padding:6px;"
-    f"selection-background-color:{ACCENT};selection-color:#12121a;}}"
-    f"QGroupBox{{border:1px solid #26262f;border-radius:12px;margin-top:18px;"
-    f"padding:16px 12px 12px 12px;font-weight:600;letter-spacing:2px;}}"
-    f"QGroupBox::title{{color:{ACCENT};subcontrol-origin:margin;left:14px;padding:0 6px;}}"
-    f"QSlider::groove:horizontal{{height:4px;background:#26262f;border-radius:2px;}}"
-    f"QSlider::handle:horizontal{{width:14px;background:{ACCENT};margin:-6px 0;"
-    f"border-radius:7px;}}"
-    f"QLabel#dim{{color:#9a97b3;}}"
+    f"QWidget{{background:{BG};color:#e8e8e8;font-family:Inter,'Segoe UI';font-size:13px;}}"
+    f"QFrame#card{{background:{PANEL};{_RAISED}border-radius:16px;}}"
+    f"QPushButton{{background:{PANEL};{_RAISED}border-radius:11px;padding:9px 14px;"
+    f"color:#dcdcdc;}}"
+    f"QPushButton:hover{{color:#ffffff;}}"
+    f"QPushButton:pressed{{background:{INSET};{_SUNK}}}"
+    f"QPushButton:disabled{{color:#5a5a5a;}}"
+    f"QPushButton#primary{{background:#f0f0f0;color:#111111;font-weight:600;"
+    f"letter-spacing:1px;border:1px solid #050505;min-height:24px;}}"
+    f"QPushButton#primary:pressed{{background:#cfcfcf;}}"
+    f"QPushButton#ghost{{background:transparent;border:none;color:{DIM};padding:6px 8px;}}"
+    f"QPushButton#ghost:hover{{color:#ffffff;}}"
+    f"QLineEdit,QComboBox,QTextEdit,QTreeWidget,QListWidget,QSpinBox,QDoubleSpinBox"
+    f"{{background:{INSET};{_SUNK}border-radius:10px;padding:6px;"
+    f"selection-background-color:#f0f0f0;selection-color:#111;}}"
+    f"QComboBox::drop-down{{border:none;width:22px;}}"
+    f"QComboBox QAbstractItemView{{background:{PANEL};color:#e8e8e8;"
+    f"selection-background-color:#f0f0f0;selection-color:#111;border:1px solid #0a0a0a;}}"
+    f"QMenu{{background:{PANEL};color:#e8e8e8;border:1px solid #0a0a0a;padding:6px;}}"
+    f"QMenu::item{{padding:6px 22px;border-radius:6px;}}"
+    f"QMenu::item:selected{{background:#f0f0f0;color:#111;}}"
+    f"QLabel#dim{{color:{DIM};}}"
+    f"QLabel#h{{color:#f2f2f2;font-weight:600;letter-spacing:4px;}}"
+    f"QHeaderView::section{{background:{PANEL};color:{DIM};border:none;padding:5px 8px;}}"
     f"QScrollBar:vertical{{background:transparent;width:10px;}}"
-    f"QScrollBar::handle:vertical{{background:#2b2b36;border-radius:5px;min-height:30px;}}"
+    f"QScrollBar::handle:vertical{{background:#2a2a2a;border-radius:5px;min-height:30px;}}"
     f"QScrollBar::add-line,QScrollBar::sub-line{{height:0;}}"
 )
+
+
+def _shadow(widget, blur=26, dy=7):
+    eff = QtWidgets.QGraphicsDropShadowEffect(widget)
+    eff.setBlurRadius(blur)
+    eff.setOffset(0, dy)
+    eff.setColor(QtGui.QColor(0, 0, 0, 160))
+    widget.setGraphicsEffect(eff)
 
 
 class _Worker(QtCore.QThread):
@@ -108,273 +129,279 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log(f"draft recovery check failed: {e}")
 
     # ================================================================= layout
+    def _card(self, parent_layout):
+        f = QtWidgets.QFrame()
+        f.setObjectName("card")
+        _shadow(f)
+        lay = QtWidgets.QVBoxLayout(f)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        parent_layout.addWidget(f)
+        return lay
+
     def _build(self):
-        root = QtWidgets.QHBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(16)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 18)
+        outer.setSpacing(0)
+        host = QtWidgets.QScrollArea()
+        host.setWidgetResizable(True)
+        host.setFrameShape(QtWidgets.QFrame.NoFrame)
+        inner = QtWidgets.QWidget()
+        col = QtWidgets.QVBoxLayout(inner)
+        col.setContentsMargins(2, 2, 10, 2)
+        col.setSpacing(16)
+        host.setWidget(inner)
+        outer.addWidget(host)
 
-        # ---------------- left: camera board
-        left = QtWidgets.QVBoxLayout()
+        # ---- header: wordmark · camera dropdown · score · settings
+        head = QtWidgets.QHBoxLayout()
+        head.setSpacing(12)
         title = QtWidgets.QLabel("MAXGAFFER")
-        title.setStyleSheet(f"color:{ACCENT};font-weight:700;letter-spacing:4px;font-size:14px;")
-        left.addWidget(title)
-        sub = QtWidgets.QLabel("reference-matched lighting · V-Ray 7 · Vantage")
-        sub.setObjectName("dim")
-        left.addWidget(sub)
-
-        self.cam_tree = QtWidgets.QTreeWidget()
-        self.cam_tree.setHeaderLabels(["camera", "ref", "score"])
-        self.cam_tree.setRootIsDecorated(False)
-        self.cam_tree.setColumnWidth(0, 170)
-        self.cam_tree.setColumnWidth(1, 36)
-        self.cam_tree.currentItemChanged.connect(self._on_camera_selected)
-        left.addWidget(self.cam_tree, 1)
-
-        row = QtWidgets.QHBoxLayout()
-        btn_refresh = QtWidgets.QPushButton("Refresh")
-        btn_refresh.clicked.connect(self.refresh_cameras)
-        row.addWidget(btn_refresh)
-        self.chk_apply_on_select = QtWidgets.QCheckBox("apply saved light on select")
-        self.chk_apply_on_select.setChecked(True)
-        self.chk_apply_on_select.toggled.connect(self._on_apply_on_select)
-        row.addWidget(self.chk_apply_on_select)
-        left.addLayout(row)
-
-        btn_settings = QtWidgets.QPushButton("Settings…")
+        title.setObjectName("h")
+        head.addWidget(title)
+        head.addStretch(1)
+        self.cam_combo = QtWidgets.QComboBox()
+        self.cam_combo.setMinimumWidth(280)
+        self.cam_combo.setToolTip("Camera — each keeps its own reference, notes, locks "
+                                  "and matched lighting state.")
+        self.cam_combo.currentIndexChanged.connect(self._on_camera_combo)
+        head.addWidget(self.cam_combo)
+        self.lbl_score = QtWidgets.QLabel("—")
+        self.lbl_score.setObjectName("dim")
+        self.lbl_score.setToolTip("Last match score for this camera.")
+        head.addWidget(self.lbl_score)
+        btn_settings = QtWidgets.QPushButton("Settings")
         btn_settings.clicked.connect(self._open_settings)
-        left.addWidget(btn_settings)
-        root.addLayout(left, 0)
+        head.addWidget(btn_settings)
+        col.addLayout(head)
 
-        # ---------------- right: work column (scrollable)
-        right_host = QtWidgets.QScrollArea()
-        right_host.setWidgetResizable(True)
-        right_host.setFrameShape(QtWidgets.QFrame.NoFrame)
-        right_w = QtWidgets.QWidget()
-        right = QtWidgets.QVBoxLayout(right_w)
-        right.setSpacing(14)
-        right_host.setWidget(right_w)
-        root.addWidget(right_host, 1)
-
-        # reference group — reference vs latest match, side by side
-        g_ref = QtWidgets.QGroupBox("REFERENCE  ·  LATEST MATCH")
-        lr = QtWidgets.QVBoxLayout(g_ref)
-        lr.setSpacing(10)
+        # ---- card: reference vs latest match
+        lr = self._card(col)
         thumbs = QtWidgets.QHBoxLayout()
         thumbs.setSpacing(14)
 
-        def _thumb(placeholder):
+        def _thumb(placeholder, cap):
+            wrap = QtWidgets.QVBoxLayout()
             t = QtWidgets.QLabel(placeholder)
             t.setFixedSize(272, 153)
             t.setAlignment(QtCore.Qt.AlignCenter)
-            t.setStyleSheet(f"background:{PANEL};border:1px dashed #2b2b36;"
-                            "border-radius:10px;color:#5a5a66;")
+            t.setStyleSheet(f"background:{INSET};{_SUNK}border-radius:12px;color:#5a5a5a;")
+            wrap.addWidget(t)
+            c = QtWidgets.QLabel(cap)
+            c.setObjectName("dim")
+            c.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
+            wrap.addWidget(c, 0, QtCore.Qt.AlignHCenter)
+            thumbs.addLayout(wrap)
             return t
 
-        self.ref_thumb = _thumb("no reference")
-        thumbs.addWidget(self.ref_thumb)
-        self.match_thumb = _thumb("no match yet")
-        thumbs.addWidget(self.match_thumb)
-        thumbs.addStretch(1)
-        lr.addLayout(thumbs)
-        info_row = QtWidgets.QHBoxLayout()
-        info_row.setSpacing(12)
+        self.ref_thumb = _thumb("no reference", "REFERENCE")
+        self.match_thumb = _thumb("no match yet", "LATEST MATCH")
+        side = QtWidgets.QVBoxLayout()
+        side.setSpacing(10)
         btn_ref = QtWidgets.QPushButton("Load / swap reference…")
         btn_ref.clicked.connect(self._pick_reference)
-        info_row.addWidget(btn_ref)
+        side.addWidget(btn_ref)
         self.lbl_ref_info = QtWidgets.QLabel("")
         self.lbl_ref_info.setObjectName("dim")
         self.lbl_ref_info.setWordWrap(True)
-        info_row.addWidget(self.lbl_ref_info, 1)
-        lr.addLayout(info_row)
-        right.addWidget(g_ref)
+        side.addWidget(self.lbl_ref_info, 1)
+        thumbs.addLayout(side, 1)
+        lr.addLayout(thumbs)
 
-        # match group
-        g_match = QtWidgets.QGroupBox("MATCH")
-        lm = QtWidgets.QVBoxLayout(g_match)
-        prow = QtWidgets.QHBoxLayout()
-        self.chk_plan = QtWidgets.QCheckBox("scene-wide plan first")
-        self.chk_plan.setChecked(bool(self.cfg.plan_first))
-        self.chk_plan.setToolTip(
-            "Reads EVERY current setting (renderer, environment, exposure, all lights, "
-            "cameras), compares the scene to the reference, and writes an explicit change "
-            "plan — it may adjust any existing property and CREATE new lights (MG_ layer). "
-            "You preview the plan before it executes; one Ctrl+Z reverts the whole plan.")
-        prow.addWidget(self.chk_plan)
-        self.chk_auto_exec = QtWidgets.QCheckBox("auto-execute plan")
-        self.chk_auto_exec.setChecked(bool(self.cfg.auto_execute_plan))
-        self.chk_auto_exec.setToolTip("Skip the preview dialog and execute immediately.")
-        prow.addWidget(self.chk_auto_exec)
-        self.chk_deep = QtWidgets.QCheckBox("deep match → 99")
-        self.chk_deep.setToolTip(
-            "Hero-shot mode: up to 10 iterations targeting 99, then an LLM-free "
-            "coordinate-descent polish that keeps rendering fine nudges until no move "
-            "improves the score — a proven optimum. If 99 isn't reachable, the report says "
-            "the remaining gap is content, not lighting. Costs ~20-40 extra loop renders.")
-        prow.addWidget(self.chk_deep)
-        self.chk_draft = QtWidgets.QCheckBox("draft sampler")
-        self.chk_draft.setChecked(bool(self.cfg.draft_sampler))
-        self.chk_draft.setToolTip(
-            "OPT-IN: apply draft sampler settings (noise threshold / subdivs / time cap) "
-            "during the match, restored automatically afterwards — crash-safe snapshot on "
-            "disk. Never touches GI or lights.")
-        prow.addWidget(self.chk_draft)
-        prow.addStretch(1)
-        lm.addLayout(prow)
-        opts = QtWidgets.QHBoxLayout()
-        self.chk_sweep = QtWidgets.QCheckBox("sun sweep first")
-        self.chk_sweep.setChecked(True)   # a wrong sun direction wastes the whole run;
-        self.chk_sweep.setToolTip(        # 8 low-res renders are cheap insurance
-            "Grid-render 8 sun directions and let the model pick before iterating — the "
-            "robust solve for sun azimuth. Uncheck on very heavy scenes to save renders.")
-        opts.addWidget(self.chk_sweep)
-        opts.addWidget(QtWidgets.QLabel("iterations"))
-        self.spin_iters = QtWidgets.QSpinBox()
-        self.spin_iters.setRange(1, 12)
-        self.spin_iters.setValue(int(self.cfg.max_iterations))
-        opts.addWidget(self.spin_iters)
-        opts.addWidget(QtWidgets.QLabel("target"))
-        self.spin_target = QtWidgets.QDoubleSpinBox()
-        self.spin_target.setRange(50.0, 100.0)
-        self.spin_target.setValue(float(self.cfg.target_score))
-        opts.addWidget(self.spin_target)
-        opts.addStretch(1)
-        lm.addLayout(opts)
-
-        self.lock_list = QtWidgets.QListWidget()
-        self.lock_list.setMaximumHeight(96)
-        self.lock_list.setToolTip("Checked = locked. Locked parameters are never touched — "
-                                  "not by the solver, not by the model.")
-        lm.addWidget(self.lock_list)
-
-        mrow = QtWidgets.QHBoxLayout()
-        self.btn_match = QtWidgets.QPushButton("MATCH LIGHTING")
+        # ---- card: action bar (dropdowns, not checkbox walls)
+        la = self._card(col)
+        bar = QtWidgets.QHBoxLayout()
+        bar.setSpacing(10)
+        self.btn_match = QtWidgets.QPushButton("MATCH")
         self.btn_match.setObjectName("primary")
+        self.btn_match.setToolTip("Run the match against this camera's reference.")
         self.btn_match.clicked.connect(self._start_match)
-        mrow.addWidget(self.btn_match, 1)
-        self.btn_match_all = QtWidgets.QPushButton("Match ALL (refs)")
-        self.btn_match_all.setToolTip("Unattended queue: match every camera that has a "
-                                      "reference bound, one after another.")
+        bar.addWidget(self.btn_match, 1)
+        self.cmb_mode = QtWidgets.QComboBox()
+        self.cmb_mode.addItems(["Standard", "Deep → 99", "Loop only"])
+        self.cmb_mode.setToolTip(
+            "Standard — scene-wide plan + match loop.\n"
+            "Deep → 99 — plan + loop + coordinate-descent polish to the ceiling.\n"
+            "Loop only — skip the scene-wide plan.")
+        bar.addWidget(self.cmb_mode)
+
+        self.btn_locks = QtWidgets.QPushButton("Locks ▾")
+        self.btn_locks.setToolTip("Locked parameters are never touched — not by the "
+                                  "solver, not by the model.")
+        self.lock_menu = QtWidgets.QMenu(self)
+        self.btn_locks.setMenu(self.lock_menu)
+        bar.addWidget(self.btn_locks)
+
+        btn_opts = QtWidgets.QPushButton("Options ▾")
+        m = QtWidgets.QMenu(self)
+
+        def _act(label, checked, tip):
+            a = m.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(checked)
+            a.setToolTip(tip)
+            return a
+
+        self.act_sweep = _act("Sun sweep first", True,
+                              "Grid-solve the sun direction before iterating.")
+        self.act_autoexec = _act("Auto-execute plan", bool(self.cfg.auto_execute_plan),
+                                 "Skip the plan preview dialog.")
+        self.act_draft = _act("Draft sampler", bool(self.cfg.draft_sampler),
+                              "Draft render settings during matches (crash-safe restore).")
+        self.act_popup = _act("Report popup", bool(self.cfg.show_report_popup),
+                              "Show the scene-changed popup after runs.")
+        self.act_live = _act("Live-apply sliders", True,
+                             "Rig sliders write to the scene as you drag (Vantage mirrors).")
+        self.act_apply_select = _act("Apply saved light on camera switch", True, "")
+        self.act_apply_select.toggled.connect(self._on_apply_on_select)
+        btn_opts.setMenu(m)
+        bar.addWidget(btn_opts)
+
+        self.btn_match_all = QtWidgets.QPushButton("ALL")
+        self.btn_match_all.setToolTip("Match every camera that has a reference bound.")
         self.btn_match_all.clicked.connect(self._start_match_all)
-        mrow.addWidget(self.btn_match_all)
-        self.btn_cancel = QtWidgets.QPushButton("Cancel")
-        self.btn_cancel.setObjectName("danger")
+        bar.addWidget(self.btn_match_all)
+        self.btn_cancel = QtWidgets.QPushButton("✕")
+        self.btn_cancel.setToolTip("Cancel after the current step.")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self._cancel_match)
-        mrow.addWidget(self.btn_cancel)
-        lm.addLayout(mrow)
+        bar.addWidget(self.btn_cancel)
+        la.addLayout(bar)
 
-        self.log = QtWidgets.QTextEdit()      # rich text: iteration thumbnails render inline
+        # ---- card: CHANGES (the record) + collapsed transcript
+        lc = self._card(col)
+        crow = QtWidgets.QHBoxLayout()
+        cap = QtWidgets.QLabel("CHANGES")
+        cap.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
+        crow.addWidget(cap)
+        crow.addStretch(1)
+        for label, slot, tip in (("A/B", self._ab_flip, "Flip pre-match ↔ matched."),
+                                 ("Restore", self._restore_pre_match,
+                                  "Return to the pre-match light."),
+                                 ("Runs", self._open_run_dir, "Open the run folder.")):
+            b = QtWidgets.QPushButton(label)
+            b.setObjectName("ghost")
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            crow.addWidget(b)
+        self.btn_transcript = QtWidgets.QPushButton("Transcript ▾")
+        self.btn_transcript.setObjectName("ghost")
+        self.btn_transcript.clicked.connect(self._toggle_transcript)
+        crow.addWidget(self.btn_transcript)
+        lc.addLayout(crow)
+        self.changes_tree = QtWidgets.QTreeWidget()
+        self.changes_tree.setHeaderLabels(["what", "before", "after"])
+        self.changes_tree.setRootIsDecorated(True)
+        self.changes_tree.setColumnWidth(0, 320)
+        self.changes_tree.setColumnWidth(1, 140)
+        self.changes_tree.setMinimumHeight(180)
+        lc.addWidget(self.changes_tree)
+        self.log = QtWidgets.QTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(150)
-        lm.addWidget(self.log)
-        lrow = QtWidgets.QHBoxLayout()
-        btn_open_run = QtWidgets.QPushButton("Open run folder")
-        btn_open_run.clicked.connect(self._open_run_dir)
-        lrow.addWidget(btn_open_run)
-        btn_restore = QtWidgets.QPushButton("Restore pre-match light")
-        btn_restore.setToolTip("Put the lighting back exactly as it was before this "
-                               "camera's last match run (snapshotted automatically).")
-        btn_restore.clicked.connect(self._restore_pre_match)
-        lrow.addWidget(btn_restore)
-        self.btn_ab = QtWidgets.QPushButton("A/B")
-        self.btn_ab.setToolTip("Flip between the pre-match light (A) and the matched "
-                               "light (B) — Vantage mirrors the flip.")
-        self.btn_ab.clicked.connect(self._ab_flip)
-        lrow.addWidget(self.btn_ab)
-        lrow.addStretch(1)
-        lm.addLayout(lrow)
-        right.addWidget(g_match)
+        self.log.setVisible(False)
+        lc.addWidget(self.log)
 
-        # refine group — talk to the gaffer
-        g_ref2 = QtWidgets.QGroupBox("REFINE — TELL THE GAFFER")
-        lref = QtWidgets.QVBoxLayout(g_ref2)
-        lref.setSpacing(10)
-        self.ed_note = QtWidgets.QLineEdit()
-        self.ed_note.setPlaceholderText(
-            "e.g. \"exposure is too much\" · \"sun should come more from the left\" · "
-            "\"too warm, shadows too soft\"")
-        self.ed_note.returnPressed.connect(self._start_refine)
-        lref.addWidget(self.ed_note)
-        chips = QtWidgets.QGridLayout()
-        chips.setSpacing(6)
-        for i, label in enumerate(("too bright", "too dark", "too warm", "too cool",
-                                   "harder shadows", "softer shadows", "sun more left",
-                                   "sun more right")):
-            b = QtWidgets.QPushButton(label)
-            b.setObjectName("chip")
-            b.clicked.connect(lambda _c=False, t=label: self._chip_note(t))
-            chips.addWidget(b, i // 4, i % 4)
-        lref.addLayout(chips)
-        rrow = QtWidgets.QHBoxLayout()
-        self.btn_refine = QtWidgets.QPushButton("REFINE  ·  3-LENS ENSEMBLE")
+        # ---- card: refine (editable dropdown = notes + presets in one)
+        lf = self._card(col)
+        frow = QtWidgets.QHBoxLayout()
+        frow.setSpacing(10)
+        self.cmb_note = QtWidgets.QComboBox()
+        self.cmb_note.setEditable(True)
+        self.cmb_note.lineEdit().setPlaceholderText("tell the gaffer — or pick a note ▾")
+        self.cmb_note.addItems(["", "too bright", "too dark", "too warm", "too cool",
+                                "harder shadows", "softer shadows",
+                                "sun more left", "sun more right"])
+        self.cmb_note.lineEdit().returnPressed.connect(self._start_refine)
+        frow.addWidget(self.cmb_note, 1)
+        self.btn_refine = QtWidgets.QPushButton("REFINE")
         self.btn_refine.setObjectName("primary")
-        self.btn_refine.setToolTip(
-            "Your note takes instant effect via the craft table, then three agent lenses "
-            "(exposure-first / geometry-first / mood-first) propose competing corrections — "
-            "every branch is rendered and scored, the winner continues into a deep match "
-            "with your note pinned into every prompt.")
+        self.btn_refine.setToolTip("Instant craft-table nudges, then a 3-lens ensemble; "
+                                   "the measured winner continues into a deep match with "
+                                   "your note pinned into every prompt.")
         self.btn_refine.clicked.connect(self._start_refine)
-        rrow.addWidget(self.btn_refine, 1)
-        lref.addLayout(rrow)
-        right.addWidget(g_ref2)
+        frow.addWidget(self.btn_refine)
+        lf.addLayout(frow)
 
-        # rig group (sliders built dynamically from the scene)
-        g_rig = QtWidgets.QGroupBox("RIG — live controls")
-        self.rig_form = QtWidgets.QFormLayout(g_rig)
-        rig_btns = QtWidgets.QHBoxLayout()
-        btn_read = QtWidgets.QPushButton("Read scene")
-        btn_read.clicked.connect(self.rebuild_rig_controls)
-        rig_btns.addWidget(btn_read)
-        self.chk_live = QtWidgets.QCheckBox("live apply (Vantage mirrors)")
-        self.chk_live.setChecked(True)
-        rig_btns.addWidget(self.chk_live)
-        btn_hdri = QtWidgets.QPushButton("HDRI…")
-        btn_hdri.setToolTip("Swap the dome light's environment texture.")
-        btn_hdri.clicked.connect(self._pick_hdri)
-        rig_btns.addWidget(btn_hdri)
-        btn_psave = QtWidgets.QPushButton("Save preset…")
-        btn_psave.clicked.connect(self._save_preset)
-        rig_btns.addWidget(btn_psave)
-        btn_pload = QtWidgets.QPushButton("Load preset…")
-        btn_pload.clicked.connect(self._load_preset)
-        rig_btns.addWidget(btn_pload)
-        self.rig_form.addRow(rig_btns)
-        right.addWidget(g_rig)
+        # ---- card: rig
+        lg = self._card(col)
+        grow = QtWidgets.QHBoxLayout()
+        gcap = QtWidgets.QLabel("RIG")
+        gcap.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
+        grow.addWidget(gcap)
+        grow.addStretch(1)
+        for label, slot in (("Read scene", self.rebuild_rig_controls),
+                            ("HDRI…", self._pick_hdri),
+                            ("Save preset…", self._save_preset),
+                            ("Load preset…", self._load_preset)):
+            b = QtWidgets.QPushButton(label)
+            b.setObjectName("ghost")
+            b.clicked.connect(slot)
+            grow.addWidget(b)
+        lg.addLayout(grow)
+        self.rig_form = QtWidgets.QFormLayout()
+        self.rig_form.setHorizontalSpacing(18)
+        self.rig_form.setVerticalSpacing(8)
+        lg.addLayout(self.rig_form)
 
-        # vantage group
-        g_v = QtWidgets.QGroupBox("VANTAGE + FINALS")
-        lv = QtWidgets.QVBoxLayout(g_v)
-        vrow = QtWidgets.QHBoxLayout()
-        btn_link = QtWidgets.QPushButton("Live link (toggle)")
-        btn_link.setToolTip("Runs V-Ray's 'Initiate a Live-Link to Chaos Vantage' action: "
-                            "starts Vantage if needed, streams on port 20701. The SAME "
-                            "action stops the link — it is a toggle.")
+        # ---- card: output
+        lo = self._card(col)
+        orow = QtWidgets.QHBoxLayout()
+        orow.setSpacing(10)
+        ocap = QtWidgets.QLabel("OUTPUT")
+        ocap.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
+        orow.addWidget(ocap)
+        btn_link = QtWidgets.QPushButton("Live link")
+        btn_link.setToolTip("V-Ray's 'Initiate a Live-Link to Chaos Vantage' — a toggle; "
+                            "starts Vantage if needed (port 20701).")
         btn_link.clicked.connect(self._start_live_link)
-        vrow.addWidget(btn_link)
-        self.lbl_link = QtWidgets.QLabel("link: unknown")
+        orow.addWidget(btn_link)
+        b1 = QtWidgets.QPushButton("Final (selected)")
+        b1.setToolTip("V-Ray final render of this camera under its matched light.")
+        b1.clicked.connect(lambda: self._render_finals(selected_only=True))
+        orow.addWidget(b1)
+        b2 = QtWidgets.QPushButton("Final ALL")
+        b2.clicked.connect(lambda: self._render_finals(selected_only=False))
+        orow.addWidget(b2)
+        b3 = QtWidgets.QPushButton("→ Vantage queue")
+        b3.setToolTip("Export per-camera vrscenes and open Vantage's batch queue.")
+        b3.clicked.connect(self._export_for_vantage)
+        orow.addWidget(b3)
+        self.lbl_link = QtWidgets.QLabel("")
         self.lbl_link.setObjectName("dim")
-        vrow.addWidget(self.lbl_link, 1)
-        lv.addLayout(vrow)
-        vrow2 = QtWidgets.QHBoxLayout()
-        btn_render_sel = QtWidgets.QPushButton("Final render (selected)")
-        btn_render_sel.setToolTip("Renders through V-Ray in Max at final resolution — "
-                                  "stock Vantage 3.x has no headless CLI.")
-        btn_render_sel.clicked.connect(lambda: self._render_finals(selected_only=True))
-        vrow2.addWidget(btn_render_sel)
-        btn_render_all = QtWidgets.QPushButton("Render ALL matched (V-Ray)")
-        btn_render_all.clicked.connect(lambda: self._render_finals(selected_only=False))
-        vrow2.addWidget(btn_render_all)
-        lv.addLayout(vrow2)
-        vrow3 = QtWidgets.QHBoxLayout()
-        btn_export_v = QtWidgets.QPushButton("Export vrscenes → open Vantage")
-        btn_export_v.setToolTip("Exports one .vrscene per matched camera (its light "
-                                "applied) and opens Vantage — add them to Vantage's "
-                                "in-app Batch Render queue for Vantage-quality finals.")
-        btn_export_v.clicked.connect(self._export_for_vantage)
-        vrow3.addWidget(btn_export_v)
-        lv.addLayout(vrow3)
-        right.addWidget(g_v)
-        right.addStretch(1)
+        orow.addWidget(self.lbl_link, 1)
+        lo.addLayout(orow)
+        col.addStretch(1)
+
+    def _toggle_transcript(self):
+        vis = not self.log.isVisible()
+        self.log.setVisible(vis)
+        self.btn_transcript.setText("Transcript ▴" if vis else "Transcript ▾")
+
+    def _fill_changes(self, plan_report, state_rows, headline):
+        """The CHANGES panel — the requested always-visible record of what was done."""
+        t = self.changes_tree
+        t.clear()
+        top = QtWidgets.QTreeWidgetItem([headline, "", ""])
+        top.setForeground(0, QtGui.QBrush(QtGui.QColor("#f2f2f2")))
+        t.addTopLevelItem(top)
+        pr = plan_report or {"changes": [], "created": [], "warnings": []}
+        if pr.get("effect"):
+            eff = pr["effect"]
+            top.addChild(QtWidgets.QTreeWidgetItem(
+                ["plan effect (measured)", f"{eff['before']:.1f}", f"{eff['after']:.1f}"]))
+        for c in pr["changes"]:
+            top.addChild(QtWidgets.QTreeWidgetItem(
+                [f"{c['target']} · {c['prop']}", str(c["before"]), str(c["after"])]))
+        for c in pr["created"]:
+            top.addChild(QtWidgets.QTreeWidgetItem(
+                [f"+ {c['type']} '{c['name']}'", "", c["at"]]))
+        for r in state_rows:
+            top.addChild(QtWidgets.QTreeWidgetItem(
+                [r["prop"], str(r["before"]), str(r["after"])]))
+        for w in pr["warnings"]:
+            top.addChild(QtWidgets.QTreeWidgetItem(["! " + w, "", ""]))
+        top.setExpanded(True)
 
     # ================================================================= helpers
     def _log(self, msg: str):
@@ -404,43 +431,45 @@ class MaxGafferDock(QtWidgets.QWidget):
         return box.get("r")
 
     def _current_camera(self) -> str:
-        item = self.cam_tree.currentItem()
-        return item.text(0) if item else ""
-
+        data = self.cam_combo.currentData() if hasattr(self, "cam_combo") else None
+        return data or ""
     # ================================================================= cameras
     def refresh_cameras(self):
         current = self._current_camera()
-        self.cam_tree.blockSignals(True)
-        self.cam_tree.clear()
+        self.cam_combo.blockSignals(True)
+        self.cam_combo.clear()
         try:
             cams = self.ctrl.cameras()
         except Exception as e:  # noqa: BLE001
             self._log(f"camera scan failed: {e}")
             cams = []
         for c in cams:
-            score = f"{c['score']:.0f}" if c.get("score") is not None else ""
-            item = QtWidgets.QTreeWidgetItem(
-                [c["name"], "●" if c.get("reference") else "", score])
-            if c.get("reference"):
-                item.setForeground(1, QtGui.QBrush(QtGui.QColor(ACCENT)))
-            self.cam_tree.addTopLevelItem(item)
-            if c["name"] == current:
-                self.cam_tree.setCurrentItem(item)
-        self.cam_tree.blockSignals(False)
-        self.chk_apply_on_select.setChecked(
-            bool(self.ctrl.session.settings.get("apply_on_select", True)))
-        if self.cam_tree.currentItem() is None and self.cam_tree.topLevelItemCount():
-            self.cam_tree.setCurrentItem(self.cam_tree.topLevelItem(0))
+            mark = "●  " if c.get("reference") else "○  "
+            score = f"   ·  {c['score']:.0f}" if c.get("score") is not None else ""
+            self.cam_combo.addItem(mark + c["name"] + score, c["name"])
+        idx = self.cam_combo.findData(current)
+        self.cam_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cam_combo.blockSignals(False)
+        try:
+            self.act_apply_select.setChecked(
+                bool(self.ctrl.session.settings.get("apply_on_select", True)))
+        except Exception:
+            pass
+        self._sync_score_badge()
         self.rebuild_rig_controls()
+        self._rebuild_locks(self._current_camera())
 
-    def _on_camera_selected(self, item, _prev):
-        if item is None:
-            return
-        if self._busy:   # a match/batch is mid-flight — applying a saved state now would
+    def _sync_score_badge(self):
+        e = self.ctrl.session.cameras.get(self._current_camera())
+        self.lbl_score.setText(f"{e.score:.1f}" if (e and e.score is not None) else "—")
+    def _on_camera_combo(self, _idx: int):
+        if self._busy:
             self._log("busy — camera switch ignored until the current run finishes")
-            return       # yank the rig out from under the loop
-        self._ab_on_pre = False   # A/B toggle is per-camera-visit
-        name = item.text(0)
+            return
+        name = self._current_camera()
+        if not name:
+            return
+        self._ab_on_pre = False
         try:
             for w in self.ctrl.select_camera(name):
                 self._log("⚠ " + w)
@@ -448,8 +477,8 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log(f"select failed: {e}")
         self._show_reference(name)
         self._rebuild_locks(name)
+        self._sync_score_badge()
         self.rebuild_rig_controls()
-
     def _on_apply_on_select(self, checked: bool):
         self.ctrl.session.settings["apply_on_select"] = bool(checked)
         self.ctrl.save_session()
@@ -494,36 +523,35 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.lbl_ref_info.setText("Bind a lighting reference image to this camera.")
 
     def _rebuild_locks(self, cam: str):
-        self.lock_list.clear()
+        self.lock_menu.clear()
         e = self.ctrl.session.cameras.get(cam)
         locked = set(e.locks) if e else set()
         try:
             state = self.ctrl.read_state(cam)
         except Exception:
             state = LightingState()
-        for key in sorted(state.keys()):
-            it = QtWidgets.QListWidgetItem(key)
-            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-            it.setCheckState(QtCore.Qt.Checked if key in locked else QtCore.Qt.Unchecked)
-            self.lock_list.addItem(it)
-
+        keys = sorted(state.keys())
+        if not keys:
+            a = self.lock_menu.addAction("(no rig parameters)")
+            a.setEnabled(False)
+        for key in keys:
+            a = self.lock_menu.addAction(key)
+            a.setCheckable(True)
+            a.setChecked(key in locked)
     def _locks(self) -> set:
-        out = set()
-        for i in range(self.lock_list.count()):
-            it = self.lock_list.item(i)
-            if it.checkState() == QtCore.Qt.Checked:
-                out.add(it.text())
-        return out
-
+        return {a.text() for a in self.lock_menu.actions()
+                if a.isCheckable() and a.isChecked()}
     # ================================================================= rig sliders
     def rebuild_rig_controls(self):
-        while self.rig_form.rowCount() > 1:      # row 0 = the buttons row
-            self.rig_form.removeRow(1)
+        while self.rig_form.rowCount() > 0:
+            self.rig_form.removeRow(0)
         self._sliders.clear()
         try:
             state = self.ctrl.read_state(self._current_camera())
         except Exception as e:  # noqa: BLE001
-            self.rig_form.addRow(QtWidgets.QLabel(f"rig read failed: {e}"))
+            lbl = QtWidgets.QLabel(f"rig unavailable: {e}")
+            lbl.setObjectName("dim")
+            self.rig_form.addRow(lbl)
             return
         for key in sorted(state.keys()):
             spec = spec_for(key)
@@ -534,10 +562,10 @@ class MaxGafferDock(QtWidgets.QWidget):
             spin.setDecimals(2)
             spin.setSingleStep(1.0 if spec.hi - spec.lo > 20 else 0.1)
             spin.setValue(state.get(key))
+            spin.setToolTip(spec.doc)
             spin.valueChanged.connect(lambda v, k=key: self._on_slider(k, v))
             self._sliders[key] = spin
             self.rig_form.addRow(key, spin)
-
     def _pick_hdri(self):
         if self._busy:
             return
@@ -575,7 +603,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log(f"✗ {err}")
 
     def _on_slider(self, key: str, value: float):
-        if not self.chk_live.isChecked() or self._busy:
+        if not self.act_live.isChecked() or self._busy:
             return
         st = LightingState()
         if key.startswith(GROUP_PREFIX):
@@ -604,62 +632,54 @@ class MaxGafferDock(QtWidgets.QWidget):
             return
         self._busy = True
         self._cancel = False
-        self.btn_match.setEnabled(False)
-        self.btn_match_all.setEnabled(False)
+        for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+            b.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        self.cfg.max_iterations = int(self.spin_iters.value())
-        self.cfg.target_score = float(self.spin_target.value())
-        self.cfg.draft_sampler = self.chk_draft.isChecked()
-        self.cfg.plan_first = self.chk_plan.isChecked()
-        self.cfg.auto_execute_plan = self.chk_auto_exec.isChecked()
+        mode = self.cmb_mode.currentIndex()          # 0 standard · 1 deep · 2 loop-only
+        self.cfg.auto_execute_plan = self.act_autoexec.isChecked()
+        self.cfg.draft_sampler = self.act_draft.isChecked()
         self.log.clear()
         self._log(f"— match: {cam} —")
         plan_report = None
         try:
-            # everything scene-touching stays on the MAIN thread; gateway calls come back
-            # through ctrl.io → _run_blocking_io, so the UI breathes and Cancel works.
-            if self.chk_plan.isChecked():
+            if mode != 2:
                 ops, lines, meta, _raw = self.ctrl.make_plan(cam, log=self._log)
                 if not ops:
                     self._log("plan: no operations proposed — continuing to the match loop")
-                elif self.chk_auto_exec.isChecked() or PlanPreviewDialog(
+                elif self.act_autoexec.isChecked() or PlanPreviewDialog(
                         lines, meta, self).exec():
                     self._log(f"— executing plan ({len(ops)} ops) —")
                     plan_report = self.ctrl.execute_plan(ops, cam, log=self._log)
-                    if meta.get("expects"):
-                        self._log("expected: " + meta["expects"])
                 else:
                     self._log("plan declined — continuing with the match loop only")
             result = self.ctrl.run_match(
                 cam, log=self._log,
                 should_cancel=lambda: self._cancel,
                 locks=self._locks(),
-                do_sweep=self.chk_sweep.isChecked(),
-                deep=self.chk_deep.isChecked())
+                do_sweep=self.act_sweep.isChecked(),
+                deep=(mode == 1))
             score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
             ceiling = (" · ceiling proven — the gap left is content, not lighting"
                        if result.ceiling_converged and (result.best_score or 0) < 99 else "")
             self._log(f"✓ done ({result.stop_reason}) — best {score}{ceiling}")
             self._set_match_thumb(result.best_render)
-            if self.cfg.show_report_popup:
-                ChangeReportDialog(plan_report,
-                                   self.ctrl.state_change_rows(cam),
-                                   f"{cam} — {result.stop_reason}, score {score}",
-                                   self).exec()
+            headline = f"{cam} — {result.stop_reason}, score {score}"
+            self._fill_changes(plan_report, self.ctrl.state_change_rows(cam), headline)
+            if self.act_popup.isChecked():
+                ChangeReportDialog(plan_report, self.ctrl.state_change_rows(cam),
+                                   headline, self).exec()
         except (OmegaError, RuntimeError) as err:
             self._log(f"✗ {err}")
         except Exception as err:  # noqa: BLE001
             self._log(f"✗ unexpected: {err}")
         finally:
             self._busy = False
-            self._ab_on_pre = False        # a fresh match lands on B (matched)
-            self.btn_match.setEnabled(True)
-            self.btn_match_all.setEnabled(True)
+            self._ab_on_pre = False
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+                b.setEnabled(True)
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
-            self.rebuild_rig_controls()
             self._show_reference(cam)
-
     def _start_match_all(self):
         if self._busy:
             return
@@ -667,8 +687,8 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not queue:
             self._log("no cameras have references bound — bind references first")
             return
-        est = len(queue) * (int(self.spin_iters.value())
-                            + (self.cfg.sweep_count if self.chk_sweep.isChecked() else 0))
+        est = len(queue) * (int(self.cfg.max_iterations)
+                            + (self.cfg.sweep_count if self.act_sweep.isChecked() else 0))
         if QtWidgets.QMessageBox.question(
                 self, "Match ALL",
                 f"Match {len(queue)} camera(s) sequentially (~{est} loop renders total)?\n"
@@ -678,18 +698,16 @@ class MaxGafferDock(QtWidgets.QWidget):
             return
         self._busy = True
         self._cancel = False
-        self.btn_match.setEnabled(False)
-        self.btn_match_all.setEnabled(False)
+        for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+            b.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        self.cfg.max_iterations = int(self.spin_iters.value())
-        self.cfg.target_score = float(self.spin_target.value())
-        self.cfg.draft_sampler = self.chk_draft.isChecked()
+        self.cfg.draft_sampler = self.act_draft.isChecked()
         self.log.clear()
         self._log(f"— batch match: {len(queue)} cameras —")
         try:
             results = self.ctrl.match_all(log=self._log,
                                           should_cancel=lambda: self._cancel,
-                                          do_sweep=self.chk_sweep.isChecked())
+                                          do_sweep=self.act_sweep.isChecked())
             self._log("— batch summary —")
             for cam, status in results.items():
                 self._log(f"  {cam}: {status}")
@@ -698,19 +716,13 @@ class MaxGafferDock(QtWidgets.QWidget):
         finally:
             self._busy = False
             self._ab_on_pre = False
-            self.btn_match.setEnabled(True)
-            self.btn_match_all.setEnabled(True)
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+                b.setEnabled(True)
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
-            self.rebuild_rig_controls()
-
     def _cancel_match(self):
         self._cancel = True
         self._log("cancelling after the current step…")
-
-    def _chip_note(self, text: str):
-        cur = self.ed_note.text().strip()
-        self.ed_note.setText((cur + ", " + text) if cur else text)
 
     def _set_match_thumb(self, path):
         if path and os.path.exists(path):
@@ -727,7 +739,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         if self._busy:
             return
         cam = self._current_camera()
-        note = self.ed_note.text().strip()
+        note = self.cmb_note.currentText().strip()
         if not cam or not note:
             self._log("select a camera and type a note first")
             return
@@ -737,9 +749,8 @@ class MaxGafferDock(QtWidgets.QWidget):
             return
         self._busy = True
         self._cancel = False
-        self.btn_match.setEnabled(False)
-        self.btn_match_all.setEnabled(False)
-        self.btn_refine.setEnabled(False)
+        for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+            b.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self._log(f"— refine: {cam} — “{note}”")
         try:
@@ -750,10 +761,12 @@ class MaxGafferDock(QtWidgets.QWidget):
                        if result.ceiling_converged and (result.best_score or 0) < 99 else "")
             self._log(f"✓ refine done ({result.stop_reason}) — best {score}{ceiling}")
             self._set_match_thumb(result.best_render)
-            self.ed_note.clear()
-            if self.cfg.show_report_popup:
+            headline = f"{cam} — refined to {score}"
+            self._fill_changes(None, self.ctrl.state_change_rows(cam), headline)
+            self.cmb_note.setCurrentText("")
+            if self.act_popup.isChecked():
                 ChangeReportDialog(None, self.ctrl.state_change_rows(cam),
-                                   f"{cam} — refined to {score}", self).exec()
+                                   headline, self).exec()
         except (OmegaError, RuntimeError) as err:
             self._log(f"✗ {err}")
         except Exception as err:  # noqa: BLE001
@@ -761,14 +774,11 @@ class MaxGafferDock(QtWidgets.QWidget):
         finally:
             self._busy = False
             self._ab_on_pre = False
-            self.btn_match.setEnabled(True)
-            self.btn_match_all.setEnabled(True)
-            self.btn_refine.setEnabled(True)
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+                b.setEnabled(True)
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
-            self.rebuild_rig_controls()
             self._show_reference(cam)
-
     def _open_run_dir(self):
         d = self.ctrl._run_dir or cfgmod.sessions_dir()
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(d))
@@ -982,6 +992,18 @@ class SettingsDialog(QtWidgets.QDialog):
         self.ed_syspy = QtWidgets.QLineEdit(cfg.system_python)
         self.ed_syspy.setPlaceholderText("optional: python.exe with Pillow (sidecar)")
         form.addRow("system python", self.ed_syspy)
+        tune = QtWidgets.QHBoxLayout()
+        self.sp_iters = QtWidgets.QSpinBox()
+        self.sp_iters.setRange(1, 12)
+        self.sp_iters.setValue(int(cfg.max_iterations))
+        self.sp_target = QtWidgets.QDoubleSpinBox()
+        self.sp_target.setRange(50.0, 100.0)
+        self.sp_target.setValue(float(cfg.target_score))
+        tune.addWidget(QtWidgets.QLabel("iterations"))
+        tune.addWidget(self.sp_iters)
+        tune.addWidget(QtWidgets.QLabel("target"))
+        tune.addWidget(self.sp_target)
+        form.addRow("match tuning", tune)
         res = QtWidgets.QHBoxLayout()
         self.sp_w = QtWidgets.QSpinBox()
         self.sp_w.setRange(160, 1920)
@@ -1027,6 +1049,8 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg.system_python = self.ed_syspy.text().strip()
         self.cfg.loop_width = int(self.sp_w.value())
         self.cfg.loop_height = int(self.sp_h.value())
+        self.cfg.max_iterations = int(self.sp_iters.value())
+        self.cfg.target_score = float(self.sp_target.value())
         self.accept()
 
 

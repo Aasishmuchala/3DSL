@@ -83,6 +83,20 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._sliders: Dict[str, QtWidgets.QDoubleSpinBox] = {}
         self._build()
         self.refresh_cameras()
+        self._recover_draft_snapshot()
+
+    def _recover_draft_snapshot(self):
+        """A leftover snapshot means Max died mid-match with draft settings applied —
+        put the artist's render settings back before anything else happens."""
+        try:
+            from ..maxbridge import draft as df
+
+            if df.pending_snapshot():
+                self._log("⚠ recovering render settings from a previous crashed session:")
+                for line in df.restore_draft():
+                    self._log("  " + line)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"draft recovery check failed: {e}")
 
     # ================================================================= layout
     def _build(self):
@@ -170,6 +184,13 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.spin_target.setRange(50.0, 100.0)
         self.spin_target.setValue(float(self.cfg.target_score))
         opts.addWidget(self.spin_target)
+        self.chk_draft = QtWidgets.QCheckBox("draft sampler")
+        self.chk_draft.setChecked(bool(self.cfg.draft_sampler))
+        self.chk_draft.setToolTip(
+            "OPT-IN: apply draft sampler settings (noise threshold / subdivs / time cap) "
+            "during the match, restored automatically afterwards — crash-safe snapshot on "
+            "disk. Never touches GI or lights.")
+        opts.addWidget(self.chk_draft)
         opts.addStretch(1)
         lm.addLayout(opts)
 
@@ -184,6 +205,11 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.btn_match.setObjectName("primary")
         self.btn_match.clicked.connect(self._start_match)
         mrow.addWidget(self.btn_match, 1)
+        self.btn_match_all = QtWidgets.QPushButton("Match ALL (refs)")
+        self.btn_match_all.setToolTip("Unattended queue: match every camera that has a "
+                                      "reference bound, one after another.")
+        self.btn_match_all.clicked.connect(self._start_match_all)
+        mrow.addWidget(self.btn_match_all)
         self.btn_cancel = QtWidgets.QPushButton("Cancel")
         self.btn_cancel.setObjectName("danger")
         self.btn_cancel.setEnabled(False)
@@ -223,6 +249,16 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.chk_live = QtWidgets.QCheckBox("live apply (Vantage mirrors)")
         self.chk_live.setChecked(True)
         rig_btns.addWidget(self.chk_live)
+        btn_hdri = QtWidgets.QPushButton("HDRI…")
+        btn_hdri.setToolTip("Swap the dome light's environment texture.")
+        btn_hdri.clicked.connect(self._pick_hdri)
+        rig_btns.addWidget(btn_hdri)
+        btn_psave = QtWidgets.QPushButton("Save preset…")
+        btn_psave.clicked.connect(self._save_preset)
+        rig_btns.addWidget(btn_psave)
+        btn_pload = QtWidgets.QPushButton("Load preset…")
+        btn_pload.clicked.connect(self._load_preset)
+        rig_btns.addWidget(btn_pload)
         self.rig_form.addRow(rig_btns)
         right.addWidget(g_rig)
 
@@ -410,6 +446,42 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._sliders[key] = spin
             self.rig_form.addRow(key, spin)
 
+    def _pick_hdri(self):
+        if self._busy:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Dome HDRI", "", "HDR images (*.hdr *.exr *.jpg *.png *.tif)")
+        if not path:
+            return
+        how = self.ctrl.set_dome_hdri(path)
+        self._log(f"dome HDRI → {os.path.basename(path)} ({how})" if how != "failed"
+                  else "✗ could not set the dome texture (no dome, or unknown file prop — "
+                       "checklist #16)")
+
+    def _save_preset(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save lighting preset", "", "MaxGaffer preset (*.json)")
+        if not path:
+            return
+        ok = self.ctrl.save_preset(path, self._current_camera())
+        self._log(f"preset saved → {path}" if ok else f"✗ could not write {path}")
+
+    def _load_preset(self):
+        if self._busy:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load lighting preset", "", "MaxGaffer preset (*.json)")
+        if not path:
+            return
+        try:
+            for w in self.ctrl.load_preset(path, self._current_camera()):
+                self._log("⚠ " + w)
+            self._log(f"preset applied: {os.path.basename(path)}")
+            self.rebuild_rig_controls()
+            self.refresh_cameras()
+        except Exception as err:  # noqa: BLE001
+            self._log(f"✗ {err}")
+
     def _on_slider(self, key: str, value: float):
         if not self.chk_live.isChecked() or self._busy:
             return
@@ -441,9 +513,11 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._busy = True
         self._cancel = False
         self.btn_match.setEnabled(False)
+        self.btn_match_all.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.cfg.max_iterations = int(self.spin_iters.value())
         self.cfg.target_score = float(self.spin_target.value())
+        self.cfg.draft_sampler = self.chk_draft.isChecked()
         self.log.clear()
         self._log(f"— match: {cam} —")
         try:
@@ -465,10 +539,55 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._busy = False
             self._ab_on_pre = False        # a fresh match lands on B (matched)
             self.btn_match.setEnabled(True)
+            self.btn_match_all.setEnabled(True)
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
             self.rebuild_rig_controls()
             self._show_reference(cam)
+
+    def _start_match_all(self):
+        if self._busy:
+            return
+        queue = [n for n, e in self.ctrl.session.cameras.items() if e.reference]
+        if not queue:
+            self._log("no cameras have references bound — bind references first")
+            return
+        est = len(queue) * (int(self.spin_iters.value())
+                            + (self.cfg.sweep_count if self.chk_sweep.isChecked() else 0))
+        if QtWidgets.QMessageBox.question(
+                self, "Match ALL",
+                f"Match {len(queue)} camera(s) sequentially (~{est} loop renders total)?\n"
+                f"{', '.join(queue)}",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        ) != QtWidgets.QMessageBox.Yes:
+            return
+        self._busy = True
+        self._cancel = False
+        self.btn_match.setEnabled(False)
+        self.btn_match_all.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.cfg.max_iterations = int(self.spin_iters.value())
+        self.cfg.target_score = float(self.spin_target.value())
+        self.cfg.draft_sampler = self.chk_draft.isChecked()
+        self.log.clear()
+        self._log(f"— batch match: {len(queue)} cameras —")
+        try:
+            results = self.ctrl.match_all(log=self._log,
+                                          should_cancel=lambda: self._cancel,
+                                          do_sweep=self.chk_sweep.isChecked())
+            self._log("— batch summary —")
+            for cam, status in results.items():
+                self._log(f"  {cam}: {status}")
+        except Exception as err:  # noqa: BLE001
+            self._log(f"✗ batch: {err}")
+        finally:
+            self._busy = False
+            self._ab_on_pre = False
+            self.btn_match.setEnabled(True)
+            self.btn_match_all.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
+            self.refresh_cameras()
+            self.rebuild_rig_controls()
 
     def _cancel_match(self):
         self._cancel = True

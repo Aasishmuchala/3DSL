@@ -156,6 +156,27 @@ class Session:
         return [n for n, e in self.cameras.items() if e.state is not None]
 
 
+PRESET_VERSION = 1
+
+
+def preset_dumps(state: LightingState, name: str = "", now: str = "") -> str:
+    """Serialize a lighting state as a portable preset (share across scenes/machines)."""
+    return json.dumps({"maxgaffer_preset": PRESET_VERSION, "name": name, "saved_at": now,
+                       "state": state.to_dict()}, indent=1)
+
+
+def preset_loads(text: str) -> Optional[LightingState]:
+    """Parse a preset; None if it isn't one. Values re-clamped by the genome on load."""
+    try:
+        d = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or "maxgaffer_preset" not in d:
+        return None
+    state = d.get("state")
+    return LightingState.from_dict(state) if isinstance(state, dict) else None
+
+
 def _iso_now() -> str:
     import datetime
 

@@ -24,12 +24,20 @@ from ..core import metrics, omega, prompts, rules
 from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
-from ..core.session import Session, sidecar_path
+from ..core.session import Session, preset_dumps, preset_loads, sidecar_path
 from . import apply as ap
 from . import config as cfgmod
+from . import draft as df
 from . import render as rd
 from . import scene as sc
 from . import vantage as vt
+
+# formats Max reads natively but Pillow/stdlib can't — always ingest via Max transcode
+MAX_FIRST_EXTS = (".exr", ".hdr", ".tif", ".tiff")
+
+
+def _needs_max_ingest(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in MAX_FIRST_EXTS
 
 
 class Controller:
@@ -126,19 +134,36 @@ class Controller:
             return None
         if key in self._ref_cache:
             return self._ref_cache[key]
-        s = self.stats_for(ref_path)
+        s = None
+        if _needs_max_ingest(ref_path):   # EXR/HDR/TIFF: Max's bitmap I/O is the reader
+            png = self._transcode_ref(ref_path)
+            if png:
+                s = metrics.compute_stats(png)
+        if s is None:
+            s = self.stats_for(ref_path)
         if s is None:  # last resort: Max transcodes anything it can read to a small PNG
-            png = os.path.join(self._ensure_run_dir("refs"), "ref_transcode.png")
-            if rd.transcode_to_png(ref_path, png):
+            png = self._transcode_ref(ref_path)
+            if png:
                 s = metrics.compute_stats(png)
         if s is not None:
             self._ref_cache[key] = s
         return s
 
+    def _transcode_ref(self, ref_path: str) -> Optional[str]:
+        png = os.path.join(self._ensure_run_dir("refs"),
+                           "ref_" + _safe(os.path.basename(ref_path)) + ".png")
+        return rd.transcode_to_png(ref_path, png)
+
     # ------------------------------------------------------------------ LLM plumbing
     def _image_block(self, path: str) -> Optional[dict]:
         """Payload-slim image block: Pillow in-process → sidecar --b64 → raw file (small
-        renders) → Max transcode to PNG."""
+        renders) → Max transcode to PNG. EXR/HDR/TIFF skip straight to Max transcode."""
+        if _needs_max_ingest(path):
+            png = os.path.join(self._ensure_run_dir("refs"),
+                               "llm_" + _safe(os.path.basename(path)) + ".png")
+            if rd.transcode_to_png(path, png, max_dim=768):
+                return omega.image_block_from_file(png)
+            return None
         try:
             from PIL import Image  # type: ignore
             import io
@@ -265,10 +290,16 @@ class Controller:
             raise RuntimeError("reference image could not be prepared for the LLM")
 
         current = ap.read_state(rig, self._baselines, cam)
-        start, why = rules.initial_state(semantics, current,
-                                         sc.camera_yaw_deg(cam), locks)
+        start, why = rules.initial_state(semantics, current, sc.camera_yaw_deg(cam), locks,
+                                         overcast_sun_mode=self.cfg.overcast_sun_mode)
         for line in why:
             log("first guess: " + line)
+
+        draft_applied = False
+        if self.cfg.draft_sampler:
+            for line in df.apply_draft():
+                log(line)
+            draft_applied = df.pending_snapshot()
 
         def render_hook(tag: str):
             path = rd.render_frame(cam, os.path.join(run_dir, f"{tag}.png"),
@@ -308,8 +339,13 @@ class Controller:
             analytic=ref_stats is not None,
             weights=self.cfg.critic_weights or None,
         )
-        result = run_match(start, ref_stats, semantics, hooks, cfg, locks,
-                           rig_notes="; ".join(rig.get("notes", [])))
+        try:
+            result = run_match(start, ref_stats, semantics, hooks, cfg, locks,
+                               rig_notes="; ".join(rig.get("notes", [])))
+        finally:
+            if draft_applied:   # crash-safe: even a raise puts the artist's sampler back
+                for line in df.restore_draft():
+                    log(line)
         e.locks = locks
         self.session.record_match(camera_name, result.best_state, result.best_score)
         self.save_session()
@@ -317,6 +353,70 @@ class Controller:
         log(f"match finished: {result.stop_reason}, best score {score_txt} "
             f"({len(result.iterations)} iterations)")
         return result
+
+    def match_all(
+        self,
+        log: Callable[[str], None],
+        should_cancel: Callable[[], bool] = lambda: False,
+        do_sweep: bool = True,
+    ) -> Dict[str, str]:
+        """Unattended queue: match every camera that has a reference bound, sequentially.
+        Per-camera failures are recorded and the queue continues; cancel stops between
+        cameras (and mid-match via the shared flag)."""
+        results: Dict[str, str] = {}
+        queue = [name for name, e in self.session.cameras.items() if e.reference]
+        if not queue:
+            return {"": "no cameras have references bound"}
+        for i, name in enumerate(queue):
+            if should_cancel():
+                results[name] = "cancelled"
+                break
+            log(f"— batch {i + 1}/{len(queue)}: {name} —")
+            try:
+                r = self.run_match(name, log, should_cancel,
+                                   locks=None, do_sweep=do_sweep)
+                results[name] = (f"{r.best_score:.1f}" if r.best_score is not None
+                                 else r.stop_reason)
+            except Exception as err:  # noqa: BLE001 one bad camera must not kill the night
+                results[name] = f"error: {err}"
+                log(f"✗ {name}: {err}")
+        return results
+
+    # ------------------------------------------------------------------ presets / HDRI
+    def save_preset(self, path: str, camera_name: str = "") -> bool:
+        state = self.read_state(camera_name)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(preset_dumps(state, name=os.path.basename(path), now=_stamp()))
+            return True
+        except OSError:
+            return False
+
+    def load_preset(self, path: str, camera_name: str = "") -> List[str]:
+        """Apply a preset to the scene; if a camera is given, it becomes that camera's
+        saved state too. Raises on an unreadable/invalid file."""
+        with open(path, "r", encoding="utf-8") as f:
+            state = preset_loads(f.read())
+        if state is None:
+            raise RuntimeError(f"not a MaxGaffer preset: {path}")
+        warnings = self.apply_state(state, camera_name)
+        if camera_name:
+            self.session.record_match(camera_name, state, None)
+            self.save_session()
+        return warnings
+
+    def set_dome_hdri(self, hdri_path: str) -> str:
+        dome = self.rig().get("dome")
+        if dome is None:
+            return "failed"
+        how = sc.set_dome_texture(dome, hdri_path)
+        try:
+            import pymxs
+
+            pymxs.runtime.redrawViews()
+        except Exception:
+            pass
+        return how
 
     def _sweep_call(self, ref_block: dict, paths: List[str], azimuths: List[float]) -> str:
         content: List[dict] = [ref_block]

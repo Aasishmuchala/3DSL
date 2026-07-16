@@ -36,6 +36,8 @@ class Config:
     target_score: float = 82.0
     sweep_count: int = 8
     keep_runs: int = 10                      # run folders kept per camera (0 = keep all)
+    draft_sampler: bool = False              # opt-in: draft render settings during matches
+    overcast_sun_mode: str = "disable"       # or "dim" if VRaySky is sun-coupled (chk #13)
     critic_weights: Dict[str, float] = field(default_factory=dict)   # override critic defaults
     repo_path: str = ""                      # clone folder, written by install.bat
 

@@ -46,9 +46,14 @@ def initial_state(
     current: LightingState,
     camera_yaw_deg: float,
     locks: Optional[Set[str]] = None,
+    overcast_sun_mode: str = "disable",
 ) -> Tuple[LightingState, List[str]]:
     """First guess written over a copy of ``current`` (only unlocked params, only params the
-    rig actually has — i.e. keys already present in ``current``). Returns (state, rationale)."""
+    rig actually has — i.e. keys already present in ``current``). Returns (state, rationale).
+
+    ``overcast_sun_mode``: "disable" turns the VRaySun off for overcast references;
+    "dim" keeps it on at minimum intensity with a huge apparent size instead — the escape
+    hatch for rigs whose VRaySky brightness is coupled to the sun node (checklist #13)."""
     locks = locks or set()
     st = current.copy()
     why: List[str] = []
@@ -81,6 +86,10 @@ def initial_state(
             f"{semantics.get('light_quality', 'mixed')} shadow edges")
         if time_of_day in ("golden_hour", "blue_hour"):
             put("sun.intensity", 1.0, "low sun — physical sky handles the falloff")
+    elif sky == "overcast" and overcast_sun_mode == "dim" and time_of_day != "night":
+        put("sun.enabled", 1, "overcast (dim mode) — sun kept on so VRaySky stays alive")
+        put("sun.intensity", 0.05, "overcast dim mode — sun contributes ~nothing")
+        put("sun.size", 12.0, "overcast — any residual shadow is soft mush")
     else:
         put("sun.enabled", 0, f"no direct sun ({'overcast' if sky == 'overcast' else time_of_day})")
 

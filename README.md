@@ -102,8 +102,10 @@ tuples in `maxbridge/scene.py` / `exposure.py` if your build differs.
 | 10 | Loop render writes PNG with VFB off, respects size, restores render setup | select camera → MATCH with 1 iteration → check the run folder | `render.render_frame` |
 | 11 | Sun move on a Daylight-assembly sun (controller-locked transforms warn in rig notes) | try a scene with a Daylight system | `scene.classify_rig` note / detach sun |
 | 12 | Sidecar (optional): point Settings → system python at any Pillow-equipped python | `python -m maxgaffer.sidecar.metrics_cli some.jpg` prints stats JSON | `config.system_python` |
-| 13 | Sun-off looks: disabling VRaySun must not black out a VRaySky-driven environment | rules set `sun.enabled 0` for overcast refs — toggle it manually once and check the env | `core/rules.py` (keep sun on, intensity ↓ instead) |
+| 13 | Sun-off looks: disabling VRaySun must not black out a VRaySky-driven environment | rules set `sun.enabled 0` for overcast refs — toggle it manually once; if the sky dies, set `overcast_sun_mode: "dim"` in config (keeps sun on at 0.05 intensity) | `config.overcast_sun_mode` |
 | 14 | GPU contention: Vantage live link + V-Ray GPU loop renders on one card | run a match with the link up on a heavy scene; if VRAM-starved, set V-Ray to CPU for matching or close the link during MATCH | workflow note, no code |
+| 15 | Draft-sampler property names (opt-in checkbox) | tick "draft sampler", run a 1-iteration match: log shows which props changed + restored; `showProperties renderers.current` if none matched | `draft.DRAFT_PROPS` |
+| 16 | Dome HDRI file property + photometric light intensity prop | RIG → HDRI… on a dome; dim a photometric group slider | `scene.DOME_TEX_FILE`, `scene.LIGHT_MULT` |
 
 ## Known failure modes (stress-tested, round 2)
 
@@ -125,10 +127,23 @@ tuples in `maxbridge/scene.py` / `exposure.py` if your build differs.
   adopted once (by light name, persisted) and never re-captured, so MaxGaffer dimming a
   group to 0 can never poison its authored value.
 
-Known v1 limits (deliberate): VRayLights/VRayIES only for practical groups (no photometric),
-one sun + one dome (extras are ignored with a note), no volumetrics/aerial-perspective
-matching yet, no per-light solo — groups are layer-based dimmer boards, and the sweep's
-altitude hint is not yet consumed (azimuth only).
+Known limits (deliberate): one sun + one dome (extras are ignored with a note), no
+volumetrics/aerial-perspective matching, no per-light solo — groups are layer-based dimmer
+boards. Since v0.3: photometric/standard lights join the groups, EXR/HDR/TIFF references
+ingest via Max's own bitmap I/O, overcast can dim instead of disable the sun
+(`overcast_sun_mode`), and **Match ALL (refs)** queues every referenced camera unattended.
+
+## API (MaxDirector integration / any pipeline tool)
+
+```python
+from maxgaffer.api import match_camera, match_all_cameras, render_cameras_vantage
+result = match_camera("PhysCam_Hero", r"D:/refs/dusk.jpg", log=print)   # → score/state/renders
+match_all_cameras(log=print)                                            # overnight queue
+render_cameras_vantage(["PhysCam_Hero"], r"D:/out", print)              # vantage batch
+```
+Main-thread only (drives pymxs); state persists in the same session sidecar the dock uses,
+so UI and API are interchangeable mid-project. This module IS the "LightMatch engine"
+MaxDirector's SPEC deferred to its P2.
 
 ## Dev (off-Max, any OS)
 

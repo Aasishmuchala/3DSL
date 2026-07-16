@@ -53,6 +53,8 @@ SUN_TURBIDITY = ("turbidity",)
 LIGHT_ON = ("enabled", "on")
 LIGHT_MULT = ("multiplier", "intensity")
 DOME_TEX_ROT = ("horizontalRotation", "horizontal_rotation", "hRot", "tex_hrotation")
+DOME_TEX_FILE = ("HDRIMapName", "fileName", "filename", "bitmap_filename")
+DOME_TEX_ON = ("texmap_on", "useTexmap", "use_texture")
 
 
 # ------------------------------------------------------------------ cameras
@@ -154,6 +156,8 @@ def classify_rig() -> Dict[str, Any]:
         lights = []
     for lt in lights:
         cname = _class_name(lt).lower()
+        if cname == "targetobject":
+            continue    # the lights collection yields light TARGETS too — same gotcha as cameras
         if cname == "vraysun":
             if rig["sun"] is None:
                 rig["sun"] = lt
@@ -177,7 +181,12 @@ def classify_rig() -> Dict[str, Any]:
                 _add_group_light(rig, lt)
         elif cname in ("vrayies", "vrayambientlight"):
             _add_group_light(rig, lt)
-        # photometric/standard lights are left alone in v1 (V-Ray pipeline assumption)
+        elif cname in ("free_light", "target_light", "photometriclight",
+                       "omnilight", "targetspot", "freespot",
+                       "directionallight", "targetdirectionallight"):
+            # photometric + standard lights join the dimmer boards too — LIGHT_MULT
+            # candidates cover both conventions (.multiplier / .intensity)
+            _add_group_light(rig, lt)
     try:
         env = rt.environmentMap
         rig["sky_env"] = env is not None and "vraysky" in _class_name(env).lower()
@@ -284,3 +293,28 @@ def write_dome_rotation(dome, degrees_: float) -> str:
         return "node_z_rotation"
     except Exception:
         return "failed"
+
+
+def set_dome_texture(dome, hdri_path: str) -> str:
+    """Point the dome light at an HDRI file, creating a VRayBitmap texmap if the dome has
+    none. Returns how it was done ('failed' = nothing writable found)."""
+    rt = _rt()
+    tex = get_prop(dome, ("texmap",))
+    if tex is None:
+        for maker in ("VRayBitmap", "VRayHDRI"):
+            try:
+                tex = getattr(rt, maker)()
+                break
+            except Exception:
+                tex = None
+        if tex is None:
+            return "failed"
+        try:
+            dome.texmap = tex
+        except Exception:
+            return "failed"
+    used = set_prop(tex, DOME_TEX_FILE, hdri_path)
+    if used is None:
+        return "failed"
+    set_prop(dome, DOME_TEX_ON, True)   # best-effort; missing prop is fine
+    return f"texmap.{used}"

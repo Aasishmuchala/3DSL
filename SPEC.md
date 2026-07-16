@@ -3,7 +3,7 @@
 **Owner:** Aasish Muchala · **Type:** internal Sthyra pipeline tool (not sold) ·
 **Target:** 3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x ·
 **Sibling of:** MaxDirector (same Omega gateway, same hexagon, key borrowed automatically) ·
-**Status:** v0.1 + round-2 stress fixes landed 2026-07-16 · 69 pure-core tests green ·
+**Status:** v0.3.0 feature-complete 2026-07-16 (stress-fixed + full backlog) · 77 pure-core tests green ·
 awaiting on-box bring-up (tasks/plan.md P0).
 
 ## 1. Summary
@@ -58,10 +58,12 @@ maxgaffer/maxbridge/  the ONLY pymxs importer
   vantage.py            live-link probe (globals→actionMan scan→manual msg), export, CLI batch
   controller.py         session/rig/stats/LLM glue + run_match wiring + vantage two-phase
   config.py             %LOCALAPPDATA%/MaxGaffer/config.json (+ MaxDirector key borrow)
-maxgaffer/ui/dock.py  PySide6 dock: camera board · reference · match · rig sliders · vantage
+  draft.py              opt-in draft sampler: crash-safe snapshot → apply → restore/recover
+maxgaffer/api.py      public API (MaxDirector LightMatch stage): match_camera / batch / vantage
+maxgaffer/ui/dock.py  PySide6 dock: camera board · reference · match/batch · rig · vantage
 maxgaffer/sidecar/    optional Pillow stats/b64 CLI for a system python
 scripts/              install.bat · preflight.py
-tests/                69 pytest, pure core, incl. round-2 stress regressions
+tests/                77 pytest, pure core, incl. round-2 stress + v0.3 regressions
 ```
 
 ## 4. The match pipeline (with guard placement)
@@ -122,7 +124,7 @@ balance land; the last 15% is taste). The tool kills the blank-page hour, not th
 | Unsaved scene | in-memory session + loud warning |
 
 ## 8. Non-goals
-Selling/distribution · photometric/standard-light groups (v1) · volumetrics & aerial
+Selling/distribution · volumetrics & aerial
 perspective matching · multi-dome · exact HDRI *content* matching (rotation/intensity only)
 · sampler management · closing the taste gap without a human.
 

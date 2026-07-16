@@ -75,13 +75,13 @@ per-shot cost known → decide default iterations/sweep for heavy scenes.
 | 1 | ✅ **shipped v0.2** — sweep `altitude_hint` consumed (verify at P1) | free accuracy |
 | 2 | ✅ **shipped v0.2** — per-iteration thumbnails inline in the log (verify at P1) | trust + faster human abort |
 | 3 | ✅ **shipped v0.2** — A/B flip button pre-match ↔ matched (verify at P1) | the director's favorite toggle |
-| 4 | Draft-sampler session preset — OPT-IN, explicit banner + restore | loop cost is render cost; only after C2 timing data |
+| 4 | ✅ **shipped v0.3** — opt-in draft sampler w/ crash-safe on-disk snapshot + launch recovery (verify props at Spike, chk #15) | never touches GI/lights |
 | 5 | ✅ **shipped v0.2** — run-dir auto-prune, `keep_runs`=10 | disk hygiene |
-| 6 | Photometric/standard lights in groups | only if a real scene demands it |
-| 7 | EXR/ACES-aware stats (current: sRGB PNG/JPEG assumption) | needed the day refs arrive as EXR |
-| 8 | Sun-off alternative: intensity-dim mode if #13 shows VRaySky coupling | decided by Spike D |
-| 9 | Batch MATCH (queue all cameras w/ refs, unattended) | overnight matching, after loop is trusted |
-| 10 | MaxDirector integration: expose `run_match` as its LightMatch stage | SPEC'd in MaxDirector P2 — this repo IS that engine |
+| 6 | ✅ **shipped v0.3** — photometric + standard lights in groups; light-target filter (chk #16) | LIGHT_MULT covers both conventions |
+| 7 | ✅ **shipped v0.3** — EXR/HDR/TIFF refs ingest Max-first (transcode) for stats AND LLM blocks | Max bitmap I/O is the reader |
+| 8 | ✅ **shipped v0.3** — `overcast_sun_mode: "dim"` keeps sun at 0.05×/size 12 (flip after Spike D #13) | VRaySky-coupling escape hatch |
+| 9 | ✅ **shipped v0.3** — Match ALL (refs): unattended sequential queue, per-camera fault isolation, confirm dialog w/ render estimate | overnight matching |
+| 10 | ✅ **shipped v0.3** — `maxgaffer/api.py`: match_camera / match_all_cameras / apply_camera_state / render_cameras_vantage | MaxDirector's LightMatch stage |
 
 ## Risks (top 5)
 1. **WB direction inverted on box** (#6) — one visual check, one-line flip. Do it FIRST.

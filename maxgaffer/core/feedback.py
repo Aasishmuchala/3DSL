@@ -48,10 +48,13 @@ def nudges_from_note(note: str, current_keys: List[str],
     for pattern, key, delta in _RULES:
         m = re.search(pattern, low)
         if m:
-            # intensifier is LOCAL to the phrase it precedes — "way too dark, shadows too
-            # hard" doubles only the darkness nudge, not the unrelated shadow one
-            lead = low[max(0, m.start() - 24):m.start() + 12]
-            scale = 2.0 if _INTENSIFIERS.search(lead) else 1.0
+            # intensifier is LOCAL to its own clause — "way too dark, shadows too hard"
+            # doubles only the darkness nudge; the scan never crosses , ; . and/but
+            lead = low[max(0, m.start() - 24):m.start()]
+            for sep in (",", ";", ".", " and ", " but "):
+                if sep in lead:
+                    lead = lead.rsplit(sep, 1)[1]
+            scale = 2.0 if _INTENSIFIERS.search(lead + m.group(0)) else 1.0
             if key == _GROUP_WILDCARD:
                 for g in group_names:
                     deltas[f"group.{g}"] = deltas.get(f"group.{g}", 0.0) + delta * scale

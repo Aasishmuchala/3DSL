@@ -46,7 +46,7 @@ class Controller:
         self._session: Optional[Session] = None
         self._session_scene = None
         self._rig = None
-        self._baselines: Dict[int, float] = {}
+        self._baselines: Dict[str, float] = {}   # light NAME → authored multiplier
         self._ref_cache: Dict[str, Dict] = {}     # ref path+mtime → stats
         self._run_dir: Optional[str] = None
         # pure-I/O runner — the UI swaps in a worker-thread pump so gateway waits never
@@ -239,6 +239,11 @@ class Controller:
             content = [ref_block]
             if render_block is not None:
                 content.append(render_block)
+            else:  # the prompt promises two images — correct the record so the model
+                content.append(omega.text_block(   # doesn't judge the reference against itself
+                    "NOTE: the current render could not be attached — Image 1 is the "
+                    "REFERENCE and there is NO second image. Base changes on the state "
+                    "table and score history only; do not describe the render."))
             content.append(omega.text_block(prompts.deltas_user_text(
                 ctx["state_table"], ctx["semantics"], ctx["score_history"],
                 ctx["analytic_applied"], ctx["iteration"], ctx["max_iterations"],
@@ -454,9 +459,14 @@ class Controller:
         use_saved_states: bool = True,
     ) -> List[Dict]:
         """MAIN-THREAD half: per camera, apply its saved lighting state and export the
-        .vrscene. Raises on export failure (nothing has rendered yet — cheap to abort)."""
+        .vrscene. Raises on export failure (nothing has rendered yet — cheap to abort).
+        Note: the scene is left holding the LAST camera's lighting state.
+
+        vrscene exports are the heavyweight artifacts (100s of MB on real interiors), so
+        old export batches are pruned by the same keep_runs policy as loop renders."""
+        vantage_parent = self._ensure_run_dir("vantage")
+        export_dir = os.path.join(vantage_parent, _stamp())
         jobs: List[Dict] = []
-        export_dir = os.path.join(self._ensure_run_dir("vantage"), _stamp())
         for name in camera_names:
             on_progress(name, "applying + exporting")
             if use_saved_states:
@@ -470,6 +480,7 @@ class Controller:
                                    "(vrayExportVRScene missing or camera not set)")
             jobs.append({"camera": name, "scene_file": scene_file,
                          "output": os.path.join(out_dir, f"{_safe(name)}.png")})
+        prune_old_runs(vantage_parent, keep=int(self.cfg.keep_runs))
         return jobs
 
     def run_vantage_jobs(self, jobs: List[Dict],

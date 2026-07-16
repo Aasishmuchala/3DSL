@@ -41,8 +41,6 @@ def main():
         print("       → JPEG references will go through the Max-transcode fallback")
 
     def _stats_floor():
-        import io
-        import struct
         import zlib  # noqa
 
         from maxgaffer.core import png_min  # noqa

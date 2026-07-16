@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from maxgaffer.core import metrics, omega, parse, prompts, rules  # noqa: E402
 from maxgaffer.core.director import Hooks, MatchConfig, run_match, run_sun_sweep  # noqa: E402
-from maxgaffer.core.genome import LightingState, state_table  # noqa: E402
+from maxgaffer.core.genome import LightingState  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from live_gateway_smoke import discover_key  # noqa: E402

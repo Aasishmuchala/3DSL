@@ -3,7 +3,7 @@
 **Owner:** Aasish Muchala · **Type:** internal Sthyra pipeline tool (not sold) ·
 **Target:** 3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x ·
 **Sibling of:** MaxDirector (same Omega gateway, same hexagon, key borrowed automatically) ·
-**Status:** v0.3.1 feature-complete + LIVE-verified 2026-07-16 · 79 tests green · gateway smoke 4/4 · sim Phase A 98.8 asserted ·
+**Status:** v0.3.2 recheck-hardened 2026-07-16 · 85 tests green · UI executed offscreen · gateway smoke 4/4 · sim Phase A 98.8 asserted ·
 awaiting on-box bring-up (tasks/plan.md P0).
 
 ## 1. Summary

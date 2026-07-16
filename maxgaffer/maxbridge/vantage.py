@@ -105,6 +105,20 @@ def export_vrscene(path: str, camera_name: Optional[str] = None) -> Optional[str
     return path if os.path.exists(path) else None
 
 
+def _output_written(output: str) -> bool:
+    """Vantage may write frame-suffixed files (out.0000.png) instead of the exact name —
+    accept any non-empty file sharing the stem in the same folder."""
+    if os.path.exists(output) and os.path.getsize(output) > 0:
+        return True
+    folder = os.path.dirname(output) or "."
+    stem = os.path.splitext(os.path.basename(output))[0]
+    try:
+        return any(f.startswith(stem) and os.path.getsize(os.path.join(folder, f)) > 0
+                   for f in os.listdir(folder))
+    except OSError:
+        return False
+
+
 def vantage_command(console_exe: str, scene_file: str, output: str,
                     width: int, height: int, frame: int = 0) -> List[str]:
     return [
@@ -136,7 +150,7 @@ def render_stills(
         cmd = vantage_command(console_exe, job["scene_file"], job["output"], width, height)
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60)
-            if proc.returncode == 0 and os.path.exists(job["output"]):
+            if proc.returncode == 0 and _output_written(job["output"]):
                 results[cam] = "ok"
                 if on_progress:
                     on_progress(cam, "done")

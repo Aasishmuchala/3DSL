@@ -12,7 +12,8 @@ Contract notes:
   * main-thread only (it drives pymxs) — callers own threading;
   * per-camera state/reference/locks persist in the scene's session sidecar exactly as if
     driven from the dock, so the UI and API stay interchangeable mid-project;
-  * ``config_overrides`` tweaks the loaded config for THIS call only (nothing written).
+  * ``config_overrides`` mutate the shared controller's config for the REST OF THE SESSION
+    (nothing is written to disk) — pass them once up front.
 """
 
 from __future__ import annotations

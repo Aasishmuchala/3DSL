@@ -170,12 +170,21 @@ def run_match(
             if best_render is None:
                 best_state, best_render = state.copy(), path
 
+        if rec.reverted_to_best:
+            # the stats in hand describe the state we just ABANDONED — solving or asking
+            # the LLM from them would tweak the restored state on stale evidence. Re-render
+            # first; next iteration reasons from coherent measurements.
+            hooks.log(f"iter {i}: reverted — re-measuring before further changes")
+            records.append(rec)
+            continue
+
         if i == cfg.max_iterations - 1:  # last render measured; no point proposing more
             records.append(rec)
             break
 
         # ---- analytic solve (deterministic, before/independent of the LLM)
         analytic: Dict[str, float] = {}
+        ev_at_solve = state.get("exposure.ev") if "exposure.ev" in state.values else None
         if cfg.analytic and cur_stats is not None and ref_stats is not None:
             analytic = solver.analytic_pass(state, ref_stats, cur_stats, locks)
             if "exposure.ev" in analytic:
@@ -235,12 +244,12 @@ def run_match(
                 rec.llm_rejected.append(f"{k}: analytic — the solver owns it")
                 hooks.log(f"iter {i}: refused {k} (analytic — solver owns it)")
         # contaminated-iteration guard: if the solver just moved EV substantially, the
-        # render the LLM critiqued was mis-exposed — drop its absolute-brightness moves
-        # (rec.state snapshots the iteration-start values, so new-vs-start is the movement)
-        ev_before = rec.state.get("values", {}).get("exposure.ev")
+        # render the LLM critiqued was mis-exposed — drop its absolute-brightness moves.
+        # Measured against the EV at solve time (NOT the iteration-start snapshot, which
+        # goes stale when a slump-revert swapped the state mid-iteration).
         ev_after = rec.analytic_changes.get("exposure.ev")
-        ev_moved = (abs(ev_after - ev_before)
-                    if (ev_before is not None and ev_after is not None) else 0.0)
+        ev_moved = (abs(ev_after - ev_at_solve)
+                    if (ev_at_solve is not None and ev_after is not None) else 0.0)
         if ev_moved >= cfg.contaminated_ev_step:
             dropped = [k for k in proposal["changes"]
                        if k.endswith(".intensity") or k.startswith("group.")]
@@ -289,7 +298,6 @@ def run_sun_sweep(
     azimuths: List[float],
     hooks: Hooks,
     llm_pick: Callable[[List[str], List[float]], str],
-    n_validate=None,
 ) -> Tuple[Optional[float], str, str]:
     """Grid-solve the sun direction: render one low-res frame per azimuth, let the LLM do
     multiple-choice (estimation is hard, comparison is easy).

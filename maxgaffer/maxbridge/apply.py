@@ -10,7 +10,7 @@ sun from moving.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from ..core.genome import LightingState
 from . import scene as sc

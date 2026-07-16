@@ -78,9 +78,9 @@ def camera_yaw_deg(cam) -> float:
 
 
 def list_cameras() -> List[Dict[str, Any]]:
-    rt = _rt()
     out: List[Dict[str, Any]] = []
     try:
+        rt = _rt()   # inside the guard — query functions must degrade, never raise
         for o in rt.cameras:                  # cameras collection excludes targets? — filter anyway
             cname = _class_name(o)
             if "target" in cname.lower() and "camera" not in cname.lower():
@@ -96,19 +96,18 @@ def list_cameras() -> List[Dict[str, Any]]:
 
 
 def get_camera(name: str):
-    rt = _rt()
     try:
-        return rt.getNodeByName(name, exact=True)
+        return _rt().getNodeByName(name, exact=True)
     except Exception:
         return None
 
 
 def set_active_camera(name: str) -> bool:
-    rt = _rt()
     cam = get_camera(name)
     if cam is None:
         return False
     try:
+        rt = _rt()
         rt.viewport.setCamera(cam)
         rt.redrawViews()
         return True
@@ -117,8 +116,8 @@ def set_active_camera(name: str) -> bool:
 
 
 def scene_path() -> str:
-    rt = _rt()
     try:
+        rt = _rt()
         p = str(rt.maxFilePath or "")
         n = str(rt.maxFileName or "")
         return (p + n) if (p and n) else ""

@@ -1,0 +1,117 @@
+"""Full-codebase recheck regressions — each test encodes a defect found by the review."""
+
+import json
+
+from maxgaffer.core.director import Hooks, MatchConfig, run_match
+from maxgaffer.core.genome import LightingState
+from maxgaffer.core.solver import analytic_pass
+
+REF = {"log_key": 0.20, "lab_mean": [55.0, 2.0, 12.0], "lab_std": [20, 4, 6],
+       "p": {"5": 0.03, "25": 0.2, "50": 0.45, "75": 0.7, "95": 0.92},
+       "contrast": 0.89,
+       "lum_hist": [0.0] * 10 + [0.5, 0.5] + [0.0] * 20,
+       "hue_hist": [0.6, 0.4] + [0.0] * 10}
+
+
+def dark(ref):
+    s = dict(ref)
+    s["log_key"] = 0.02
+    return s
+
+
+# ------------------------------------------------- solver capability gate (exposure-less rig)
+def test_solver_never_proposes_params_the_rig_lacks():
+    st = LightingState()
+    st.set("sun.azimuth_deg", 100.0)           # a rig with no exposure host at all
+    assert analytic_pass(st, REF, dark(REF)) == {}
+    st.set("exposure.ev", 12.0)                # EV host only — WB still absent
+    changes = analytic_pass(st, REF, dark(REF))
+    assert "exposure.ev" in changes
+    assert "exposure.wb_kelvin" not in changes
+
+
+def test_exposure_less_rig_runs_clean_no_phantom_keys_no_false_leash():
+    st = LightingState()
+    for k, v in {"sun.enabled": 1, "sun.azimuth_deg": 100.0, "sun.altitude_deg": 30.0,
+                 "sun.intensity": 1.0}.items():
+        st.set(k, v)
+    logs = []
+    hooks = Hooks(apply=lambda s: None, render=lambda t: f"/tmp/{t}.png",
+                  stats=lambda p: dark(REF),
+                  llm_deltas=lambda ctx: json.dumps(
+                      {"assessment": "", "changes": [], "stop": False}),
+                  log=logs.append)
+    res = run_match(st, REF, {}, hooks, MatchConfig(max_iterations=3, stall_patience=99))
+    assert "exposure.ev" not in res.best_state.values          # no phantom key created
+    assert all(not r.analytic_changes for r in res.iterations)  # solver stayed silent
+    assert not any("leash" in m or "albedo" in m for m in logs)  # no false diagnosis
+
+
+# ------------------------------------------------- slump-revert must re-measure, not re-tweak
+def test_revert_iteration_skips_solve_and_llm():
+    """After a slump-revert, the stats in hand describe the ABANDONED state — the loop must
+    re-render before solving or asking the LLM anything (found by this recheck: it was
+    applying stale-evidence changes to the restored state)."""
+    good, bad = dict(REF), dark(REF)
+    # iter0 great (best), iter1+2 slump (revert fires on iter2), iter3 re-measures
+    stats_seq = [good, bad, bad, good]
+    reply = json.dumps({"assessment": "", "changes": [
+        {"param": "sun.intensity", "value": 1.4, "why": "ratio"}], "stop": False})
+    replies = [reply] * 4
+    llm_calls = []
+
+    def llm(ctx):
+        llm_calls.append(ctx["iteration"])
+        return replies.pop(0)
+
+    hooks = Hooks(apply=lambda s: None, render=lambda t: f"/tmp/{t}.png",
+                  stats=lambda p: stats_seq.pop(0) if stats_seq else dict(REF),
+                  llm_deltas=llm, log=lambda m: None)
+    st = LightingState()
+    for k, v in {"sun.enabled": 1, "sun.azimuth_deg": 100.0, "sun.intensity": 1.0,
+                 "exposure.ev": 12.0, "exposure.wb_kelvin": 6500.0}.items():
+        st.set(k, v)
+    res = run_match(st, REF, {}, hooks,
+                    MatchConfig(max_iterations=4, target_score=101, stall_patience=99,
+                                slump_tolerance=1.0))
+    reverted = [r for r in res.iterations if r.reverted_to_best]
+    assert reverted, "test setup should trigger a revert"
+    rev = reverted[0]
+    assert rev.analytic_changes == {}          # no solve from stale stats
+    assert rev.llm_accepted == {} and rev.assessment == ""   # no LLM on stale evidence
+    assert rev.index not in llm_calls
+    # and the loop continued afterwards (re-measured the restored state)
+    assert any(r.index > rev.index for r in res.iterations)
+
+
+# ------------------------------------------------- vantage output detection (frame suffixes)
+def test_vantage_output_written_accepts_frame_suffixes(tmp_path):
+    from maxgaffer.maxbridge.vantage import _output_written
+
+    exact = tmp_path / "Cam01.png"
+    assert not _output_written(str(exact))
+    (tmp_path / "Cam01.0000.png").write_bytes(b"x" * 10)   # Vantage-style frame suffix
+    assert _output_written(str(exact))
+    exact.write_bytes(b"")                                  # empty exact file ≠ success
+    assert _output_written(str(exact))                      # (suffix file still counts)
+    (tmp_path / "Cam01.0000.png").unlink()
+    assert not _output_written(str(exact))                  # empty-only → not written
+
+
+# ------------------------------------------------- bridge query functions degrade off-Max
+def test_bridge_queries_never_raise_off_max():
+    from maxgaffer.maxbridge import scene as sc
+
+    assert sc.scene_path() == ""
+    assert sc.list_cameras() == []
+    assert sc.get_camera("X") is None
+    assert sc.set_active_camera("X") is False
+
+
+def test_controller_session_and_prune_work_off_max(tmp_path):
+    from maxgaffer.maxbridge.controller import Controller
+
+    ctrl = Controller()
+    assert ctrl.session is not None            # unsaved-scene in-memory session
+    assert ctrl.cameras() == []                # graceful, no raise
+    assert ctrl.save_session() is False        # nothing to persist → honest False

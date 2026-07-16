@@ -7,7 +7,7 @@ then degrade gracefully instead of applying garbage to a client scene.
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Sequence
 
 from .omega import parse_json_from_text
 

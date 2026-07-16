@@ -61,15 +61,20 @@ def analytic_pass(
     cur_stats: Dict,
     locks: Optional[set] = None,
 ) -> Dict[str, float]:
-    """The changes the solver wants this iteration ({} when everything is in the deadband)."""
+    """The changes the solver wants this iteration ({} when everything is in the deadband).
+
+    Capability-gated: a key absent from ``state`` means the rig has no host for it
+    (read_state only includes supported params) — proposing it anyway would create a
+    phantom parameter the bridge warns about every iteration and, worse, walk the leash
+    into a false albedo diagnosis while changing nothing on screen."""
     locks = locks or set()
     changes: Dict[str, float] = {}
-    if "exposure.ev" not in locks:
-        ev = solve_ev(ref_stats, cur_stats, state.get("exposure.ev", 10.0))
+    if "exposure.ev" in state.values and "exposure.ev" not in locks:
+        ev = solve_ev(ref_stats, cur_stats, state.get("exposure.ev"))
         if ev is not None:
             changes["exposure.ev"] = ev
-    if "exposure.wb_kelvin" not in locks:
-        wb = solve_wb(ref_stats, cur_stats, state.get("exposure.wb_kelvin", 6500.0))
+    if "exposure.wb_kelvin" in state.values and "exposure.wb_kelvin" not in locks:
+        wb = solve_wb(ref_stats, cur_stats, state.get("exposure.wb_kelvin"))
         if wb is not None:
             changes["exposure.wb_kelvin"] = wb
     return changes

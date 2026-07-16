@@ -12,7 +12,7 @@ Everything numeric the model is asked for is bounded inline; everything it must 
 from __future__ import annotations
 
 import json
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Sequence, Tuple
 
 ANALYZE_SYSTEM = """You are a master gaffer and DP analyzing a LIGHTING REFERENCE image for an
 architectural visualization match in 3ds Max + V-Ray. Study the image's light, not its content.

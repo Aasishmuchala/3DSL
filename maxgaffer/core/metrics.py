@@ -125,9 +125,10 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         hue, chroma = _rgb_to_hue_chroma(r, g, b)
         if chroma > 0.02:  # near-neutrals carry no hue information
             hue_hist[int(hue / 360.0 * HUE_BINS) % HUE_BINS] += chroma
+    lums.sort()   # one sort serves both the percentiles and the highlight threshold
     # highlight chromaticity — the top luminance quartile carries the ILLUMINANT's color
     # (white-patch assumption), far less contaminated by scene albedo than the full mean
-    hi_thresh = sorted(lums)[max(0, int(0.75 * len(lums)) - 1)]
+    hi_thresh = lums[max(0, int(0.75 * len(lums)) - 1)]
     hi_sum = [0.0, 0.0, 0.0]
     hi_n = 0
     for r, g, b in pixels:
@@ -137,7 +138,6 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
             hi_sum[1] += a
             hi_sum[2] += bb
             hi_n += 1
-    lums.sort()
 
     def pct(p: float) -> float:
         return lums[min(n - 1, int(p / 100.0 * n))]

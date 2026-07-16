@@ -3,7 +3,7 @@
 **Owner:** Aasish Muchala · **Type:** internal Sthyra pipeline tool (not sold) ·
 **Target:** 3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x ·
 **Sibling of:** MaxDirector (same Omega gateway, same hexagon, key borrowed automatically) ·
-**Status:** v0.4.0 STACK-VERIFIED 2026-07-16 (official docs: V-Ray 7 · Vantage 3.3 · Max 2026 Py 3.11.9) · 86 tests green · gateway smoke 4/4 · sim Phase A 98.8 asserted ·
+**Status:** v0.6.1 QUALITY-HARDENED 2026-07-16 · 107 tests · live benchmark: Phase A 99.0 asserted, Phase B 90.0 target_reached (full live pipeline) · stack doc-verified ·
 awaiting on-box bring-up (tasks/plan.md P0).
 
 ## 1. Summary
@@ -18,13 +18,13 @@ matched cameras through vantage_console" is one button.
 
 | Decision | Choice |
 |---|---|
-| Split of powers | **math owns EV/WB** (histogram solver) · **LLM owns semantics** (≤4 bounded changes/iter) · **sweep owns coarse sun azimuth** (multiple-choice beats estimation) · **critic owns accept/revert** · **human owns taste** (locks, sliders, restore) |
+| Split of powers | **math owns EV/WB** (histogram solver, highlight-quartile WB) · **LLM owns semantics** (3-sample ANALYZE consensus; ≤4 bounded changes/iter, trajectory-aware) · **sweep owns coarse sun azimuth** (LLM multiple-choice × direction-metric cross-check) · **critic owns accept/revert** (incl. direction component) · **human owns taste** (locks, sliders, restore, plan preview + measured plan effect) |
 | Genome as gate | every proposal validated: unknown → dropped, locked → refused, bounds → clamped, per-iter steps → limited; 180° wrap resolves clockwise (deterministic antipode) |
 | Trust model | **snapshot-first**: pre-match state auto-saved per camera + Restore button · one undo record per apply · matches are explorations, never commitments |
 | Baselines | practical-group authored multipliers keyed by **light NAME**, persisted in session, **adopt-once, never re-captured** (kills the 0-poisoning failure); `forget_baseline` = explicit re-author hook |
 | Analytic leash | EV/WB solver bounded to **±4 EV / ±3000 K total per run**; ≥2 leash hits → explicit albedo-mismatch diagnosis in the log ("lock EV, set by eye") |
 | Contamination guard | analytic EV move ≥1.5 stops in an iteration → LLM intensity/group proposals for that iteration dropped (geometry survives); drops recorded in the audit trail (extend, never overwrite) |
-| Stats | tone + color mood ONLY (key/envelope/EMD/LAB/hue) — no SSIM across different scenes; exposure key **center-weighted 60/40** (middle half of frame) |
+| Stats | tone + color mood + DIRECTION (mean-centered 3×3 luminance grid — cross-scene-safe) — no SSIM; exposure key **center-weighted 60/40**; WB chroma from the **highlight quartile** (white-patch assumption, albedo-trap counter) |
 | LLM wire | Omega `/v1/messages`, opus-4.8 vision, **no tools** (schema-in-prompt), base64 image blocks, retries w/ backoff, **one strict retry** on non-JSON analyze reply |
 | Threading | pymxs on Max's MAIN thread, always · gateway/sidecar/vantage-batch on workers via injectable `io` runner · worker progress → Qt signal relay · camera board locked while a run is live |
 | Dependencies | **stdlib floor** (urllib client + built-in PNG reader — loop stats can never fail); Pillow optional upgrade; no torch, no OpenCV, no required pip package |

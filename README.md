@@ -20,16 +20,21 @@ key — borrowed automatically if MaxDirector is installed).
 
 | Job | Owner | Why |
 |---|---|---|
-| Exposure (EV) + white balance | **histogram solver** (deterministic) | measurable — never let an LLM eyeball photometry |
-| Sun azimuth (coarse) | **sweep grid + LLM multiple-choice** | comparison is reliable where estimation is not |
+| Exposure (EV) + white balance | **histogram solver** (deterministic; WB reads the HIGHLIGHT quartile — the illuminant, not the furniture) | measurable — never let an LLM eyeball photometry |
+| Reference semantics | **3-sample ANALYZE consensus** (majority/median/circular-mean) | a single sample coin-flips; three don't |
+| Sun azimuth (coarse) | **sweep grid + LLM multiple-choice, cross-checked by the direction metric** | two independent judges on the weakest call |
 | Sun geometry refine, sky character, HDRI rotation, light-group balance, mood | **Opus 4.8 vision** via Omega, ≤4 bounded changes/iteration | semantic judgment, hard-railed by the genome |
 | Accept / revert / stop | **tonal critic** (deterministic 0-100) | keep-best + slump-revert make exploration safe |
 | Taste, final say | **you** | locks, live sliders, undo — one undo record per apply |
 
 Every LLM proposal is validated against the **genome** (`core/genome.py`): unknown params
 dropped, locked params refused, bounds clamped, per-iteration step limits enforced. The
-critic compares only what transfers between *different* scenes — tonal envelope and color
-mood — never SSIM.
+critic compares only what transfers between *different* scenes — tonal envelope, color
+mood, and (since v0.6) a mean-centered 3×3 luminance grid: WHERE the light lives — never
+SSIM. The loop shows the model its own parameter trajectory to damp oscillation, and every
+executed plan is probe-rendered before/after with the critic's verdict in the popup.
+Measured on the live hidden-target benchmark: Phase B 14.7 → **90.0 (target_reached)**
+vs the pre-v0.6 baseline of 85.1 best / 56.6 stalled.
 
 ## Architecture (hexagon, enforced)
 

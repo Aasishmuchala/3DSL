@@ -6,12 +6,14 @@ mood. It is the loop's accept/revert arbiter and convergence signal, not a beaut
 LLM (and the human) own the last mile of taste, exactly like MaxDirector's geometric critic
 gates its storyboards.
 
-Components (weights config-tunable, must sum to 1):
+Components (weights config-tunable; renormalized over whatever was measurable):
   key       exposure match — log2 distance between geometric-mean linear luminances
   envelope  shadow/highlight placement — p5 + p95 luminance deltas
   histogram luminance distribution shape — 1-D EMD
   color     chromatic mood — LAB mean distance (a*, b* weighted over L)
   hue       hue distribution — chroma-weighted cosine similarity
+  direction WHERE the light lives — cosine of mean-centered 3×3 luminance grids (the one
+            spatial signal that transfers across different scenes lit the same way)
 """
 
 from __future__ import annotations
@@ -56,7 +58,6 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
     w = dict(DEFAULT_WEIGHTS)
     if weights:
         w.update({k: float(v) for k, v in weights.items() if k in w})
-    total_w = sum(w.values()) or 1.0
 
     key_ref = max(1e-5, float(ref.get("log_key", 0.0)))
     key_cur = max(1e-5, float(cur.get("log_key", 0.0)))

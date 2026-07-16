@@ -348,6 +348,8 @@ def run_sun_sweep(
     except ParseError as e:
         return None, "na", f"sweep reply unusable: {e}"
     idx = picked["best_index"]
+    # cross-check only when EVERY probe was measurable — a partial score table could
+    # crown a probe merely because its rivals went unmeasured (predictability > cleverness)
     if all(s is not None for s in dir_scores):
         metric_idx = max(range(len(dir_scores)), key=lambda i: dir_scores[i])
         if metric_idx != idx and dir_scores[metric_idx] - dir_scores[idx] > 0.15:

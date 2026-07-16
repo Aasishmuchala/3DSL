@@ -1,6 +1,5 @@
 """Round-3 stress regressions — attacks on the v0.5 agent mode that landed."""
 
-import json
 
 from maxgaffer.core import scenedigest
 from maxgaffer.core.genome import LightingState

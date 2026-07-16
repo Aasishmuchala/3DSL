@@ -1,4 +1,3 @@
-import math
 
 from maxgaffer.core import critic, solver
 from maxgaffer.core.genome import LightingState

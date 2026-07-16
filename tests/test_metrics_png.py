@@ -1,7 +1,6 @@
 """The stdlib PNG floor must agree with Pillow — it is what runs inside Max."""
 
 import math
-import os
 
 import pytest
 

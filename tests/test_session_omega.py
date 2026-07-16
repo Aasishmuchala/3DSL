@@ -4,7 +4,7 @@ import pytest
 
 from maxgaffer.core import omega
 from maxgaffer.core.genome import LightingState
-from maxgaffer.core.session import CameraEntry, Session, sidecar_path
+from maxgaffer.core.session import Session, sidecar_path
 
 
 # --------------------------------------------------------------------------- session

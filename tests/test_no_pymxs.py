@@ -4,7 +4,6 @@ Same enforcement as MaxDirector: pymxs and Qt may only appear in maxbridge/ and 
 """
 
 import importlib
-import os
 import pathlib
 
 CORE = pathlib.Path(__file__).parent.parent / "maxgaffer" / "core"

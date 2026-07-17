@@ -202,6 +202,30 @@ def test_build_seed_explicit_sun_overrides_semantics(tmp_path):
     assert meta["sun"]["altitude_deg"] == 12.0
 
 
+def test_hdr_nan_channel_does_not_crash(tmp_path):
+    """max(1.0, nan) keeps 1.0 — a NaN in a NON-max channel used to reach int(nan) and
+    raise ValueError mid-write. Sanitize is per-channel now."""
+    nan, inf = float("nan"), float("inf")
+    assert hdr_min.float_to_rgbe(nan, 1.0, inf)[1] > 0    # finite channel survives
+    assert hdr_min.float_to_rgbe(nan, nan, nan) == (0, 0, 0, 0)
+    p = str(tmp_path / "nan.hdr")
+    assert hdr_min.write_hdr(p, [[(nan, 1.0, inf), (0.5, 0.5, 0.5)] * 8])
+    back = hdr_min.read_hdr(p)
+    assert back is not None
+    r, g, b = back[0][0]
+    assert r == 0.0 and b == 0.0 and abs(g - 1.0) < 0.02
+
+
+def test_seed_filename_token_changes_path():
+    """Max caches bitmaps by path — a re-seed with changed inputs must change the file
+    NAME, or the dome renders the stale pano."""
+    a = domeseed.seed_filename("Cam A", "11112222")
+    b = domeseed.seed_filename("Cam A", "33334444")
+    assert a != b
+    assert a.startswith("seed_Cam_A_") and a.endswith(".hdr")
+    assert domeseed.seed_filename("Cam A") == "seed_Cam_A.hdr"   # token optional
+
+
 def test_snap_fov_divides_180():
     for fov in (90.0, 100.0, 120.0, 60.0, 75.0):
         snapped = domeseed.snap_fov(fov)
@@ -253,3 +277,22 @@ def test_scenarios_respect_locks():
     for b in board:
         assert b["state"].get("sun.altitude_deg") == cur.get("sun.altitude_deg"), \
             f"{b['key']} moved a locked parameter"
+
+
+def test_scenarios_empty_rig_returns_empty_board():
+    """No writable rig params → rules can't move anything → every card would be a no-op.
+    The board must say so (empty), not render one meaningless candidate."""
+    assert scenarios.build_scenarios(None, LightingState(), 0.0) == []
+
+
+def test_api_as_state_accepts_both_forms_and_rejects_junk():
+    """A LightingState fed to from_dict would 'succeed' as an EMPTY state (its .get
+    method answers 'values' with 0.0) and silently wipe the camera on adopt."""
+    from maxgaffer.api import _as_state
+
+    st = _full_rig_state()
+    assert _as_state(st) is st
+    round_tripped = _as_state(st.to_dict())
+    assert not st.diff(round_tripped)                    # dict form → same rig
+    with pytest.raises(TypeError):
+        _as_state(["not", "a", "state"])

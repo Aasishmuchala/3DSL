@@ -24,8 +24,13 @@ _MIN_RLE_WIDTH, _MAX_RLE_WIDTH = 8, 32767
 
 # --------------------------------------------------------------------------- pixel codec
 def float_to_rgbe(r: float, g: float, b: float) -> Tuple[int, int, int, int]:
+    # per-channel sanitize BEFORE max(): max(1.0, nan) keeps the finite value, so a NaN
+    # in a non-max channel would sail past a max-only guard into int(nan) → ValueError
+    r = r if math.isfinite(r) and r > 0.0 else 0.0
+    g = g if math.isfinite(g) and g > 0.0 else 0.0
+    b = b if math.isfinite(b) and b > 0.0 else 0.0
     m = max(r, g, b)
-    if m < 1e-9 or not math.isfinite(m):
+    if m < 1e-9:
         return 0, 0, 0, 0
     _mant, exp = math.frexp(m)              # m = mant * 2**exp, mant in [0.5, 1)
     scale = math.ldexp(1.0, 8 - exp)        # component * scale lands in [0, 256)

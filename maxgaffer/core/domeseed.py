@@ -342,6 +342,9 @@ def build_seed(
     }
 
 
-def seed_filename(camera_name: str) -> str:
+def seed_filename(camera_name: str, token: str = "") -> str:
+    """``token`` (input fingerprint) goes into the NAME deliberately: Max caches bitmaps
+    by path, so re-seeding into the same filename can render the STALE pano — a changed
+    input must produce a changed path."""
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in camera_name) or "cam"
-    return f"seed_{safe}.hdr"
+    return f"seed_{safe}_{token}.hdr" if token else f"seed_{safe}.hdr"

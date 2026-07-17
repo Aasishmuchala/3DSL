@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional
 
+from .core.genome import LightingState
 from .maxbridge import config as _config
 from .maxbridge.controller import Controller
 
@@ -114,18 +115,29 @@ def scenario_board(
     config_overrides: Optional[Dict] = None,
 ) -> List[Dict]:
     """Render + score the candidate rigs (reference optional). The scene is left as it
-    was found. → [{key, label, why, state, render, score}]."""
-    return get_controller(config_overrides).run_scenarios(camera_name, log=log,
-                                                          should_cancel=should_cancel)
+    was found. → [{key, label, why, state, render, score}] with ``state`` as a plain
+    genome DICT (JSON-safe pipeline seam) — feed it straight back to adopt_scenario."""
+    results = get_controller(config_overrides).run_scenarios(camera_name, log=log,
+                                                             should_cancel=should_cancel)
+    return [{**r, "state": r["state"].to_dict()} for r in results]
 
 
-def adopt_scenario(camera_name: str, state_dict: Dict,
+def _as_state(state) -> LightingState:
+    """Accept a LightingState OR its to_dict() form. Anything else raises — a wrong type
+    fed to from_dict would 'succeed' as an EMPTY state and silently wipe the camera."""
+    if isinstance(state, LightingState):
+        return state
+    if isinstance(state, dict):
+        return LightingState.from_dict(state)
+    raise TypeError(f"state must be a LightingState or its to_dict() form, "
+                    f"got {type(state).__name__}")
+
+
+def adopt_scenario(camera_name: str, state,
                    score: Optional[float] = None) -> List[str]:
-    """Apply a board candidate's state dict and save it as the camera's state."""
-    from .core.genome import LightingState
-
-    ctrl = get_controller()
-    return ctrl.adopt_scenario(camera_name, LightingState.from_dict(state_dict), score)
+    """Apply a board candidate (dict from scenario_board, or a LightingState) and save
+    it as the camera's state."""
+    return get_controller().adopt_scenario(camera_name, _as_state(state), score)
 
 
 def render_cameras(

@@ -104,7 +104,22 @@ class Controller:
             e = self.session.cameras.get(camera_name)
             if e and e.state is not None:
                 warnings = self.apply_state(e.state, camera_name)
+            self._rebind_seed(camera_name)     # the dome is scene-global; seeds are not
         return warnings
+
+    def _rebind_seed(self, camera_name: str) -> None:
+        """Per-camera dome seeds live on ONE scene-global dome — whenever a camera's
+        light is applied for viewing or rendering, its own seed must come back, or shot A
+        silently renders under shot B's sky. Never touches rotation: the applied state
+        owns dome.rotation_deg (only the initial seed bind zeroes it)."""
+        e = self.session.cameras.get(camera_name)
+        if not (e and e.seed_hdri) or not os.path.exists(e.seed_hdri):
+            return
+        dome = self.rig().get("dome")
+        if dome is None:
+            return
+        if sc.get_dome_texture(dome) != e.seed_hdri:
+            sc.set_dome_texture(dome, e.seed_hdri)
 
     # ------------------------------------------------------------------ stats providers
     def stats_for(self, path: str) -> Optional[Dict]:
@@ -726,8 +741,19 @@ class Controller:
         if not e.pre_seed:                     # snapshot once; Restore clears it
             e.pre_seed = {"file": sc.get_dome_texture(dome),
                           "rotation": sc.read_dome_rotation(dome)}
+        # fingerprint the inputs into the FILENAME: Max caches bitmaps by path, so a
+        # re-seed (new reference, moved sun) into the same file can render stale
+        import hashlib
+
+        try:
+            ref_sig = f"{e.reference}:{os.path.getmtime(e.reference):.0f}"
+        except OSError:
+            ref_sig = e.reference
+        token = hashlib.md5(
+            f"{ref_sig}|{sun_az}|{sun_alt}".encode("utf-8", "replace")).hexdigest()[:8]
         out = os.path.join(self._ensure_run_dir(_safe(camera_name)),
-                           domeseed.seed_filename(camera_name))
+                           domeseed.seed_filename(camera_name, token))
+        prev_seed = e.seed_hdri
         yaw = sc.camera_yaw_deg(cam) if cam is not None else 0.0
         src = e.reference
         if _needs_max_ingest(src):             # EXR/HDR/TIFF ref: Max transcodes first
@@ -749,6 +775,11 @@ class Controller:
                                "— checklist #16)")
         rot_how = sc.write_dome_rotation(dome, 0.0)
         e.seed_hdri = out
+        if prev_seed and prev_seed != out and os.path.basename(prev_seed).startswith("seed_"):
+            try:
+                os.remove(prev_seed)           # superseded seed — don't litter the run dir
+            except OSError:
+                pass
         self.save_session()
         sun = meta.get("sun")
         log(f"dome seed: {os.path.basename(out)} ({meta['source']}, {how}, "
@@ -862,6 +893,7 @@ class Controller:
                 e = self.session.cameras.get(name)
                 if e and e.state is not None:
                     self.apply_state(e.state, name)
+                self._rebind_seed(name)        # each vrscene must carry ITS camera's sky
             scene_file = vt.export_vrscene(
                 os.path.join(export_dir, f"{_safe(name)}.vrscene"), name)
             if scene_file is None:
@@ -894,6 +926,7 @@ class Controller:
             e = self.session.cameras.get(name)
             if e and e.state is not None:
                 self.apply_state(e.state, name)
+            self._rebind_seed(name)            # finals render under their own seed too
             cam = sc.get_camera(name)
             if cam is None:
                 results[name] = "camera not found"

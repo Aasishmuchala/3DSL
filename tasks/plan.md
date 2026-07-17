@@ -66,6 +66,10 @@ expected groups; no ⚠ property warnings when moving each RIG slider once.
    `controller.seed_dome` (rotation currently zeroed) and the loop absorbs it either way.
 3. **Restore pre-match** after a seed: previous HDRI file + rotation return (a dome that
    had NO texture gets its texmap disabled instead — confirm it doesn't render black).
+   Then seed TWO cameras and switch between them: the dome must follow each camera's own
+   seed (`_rebind_seed` on select/finals/vrscene-export), and a RE-seed with a swapped
+   reference must visibly change the dome (fingerprinted filename defeats the bitmap
+   cache — if it still shows stale, note it and we force a bitmap reload call here).
 4. **BOARD** on the same camera: 5-6 candidates render, scores shown when a reference is
    bound, ADOPT applies + saves, "Keep current light" leaves the scene untouched.
 **→ CHECKPOINT 0: preflight all-green inside Max. Commit "on-box verified" with the diff.**

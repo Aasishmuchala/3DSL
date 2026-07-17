@@ -81,7 +81,11 @@ live genome param). The previous dome texture/rotation is snapshotted once — *
 puts it back. This is the deterministic, local, reproducible version of Chaos's AI Mood
 Match (V-Ray 7 U3, SketchUp/Rhino-only) — and for a generative pano, `build_seed`'s
 `pano_path` ingests any external equirect (DiffusionLight-class estimators) through the
-identical orient/inject pipeline.
+identical orient/inject pipeline. Seeds are per camera and follow the shot: switching
+cameras, batch finals and vrscene exports re-bind each camera's own seed. Honest limit:
+the pano is deliberately blurred illumination, so where the dome is VISIBLE in glossy
+reflections or through glazing it reads as soft color, not a crisp sky — keep the dome
+camera-invisible on shots where that matters.
 
 **BOARD** (action bar) is Light Gen with numbers: up to six candidate rigs — as-analyzed,
 golden low, overcast soft, backlit rim, cool north, practicals at dusk — each built by the

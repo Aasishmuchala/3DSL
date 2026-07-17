@@ -91,6 +91,8 @@ def build_scenarios(
     neutral base, minus the "as analyzed" slot which would be meaningless. Variants whose
     state collapses onto an earlier one (a rig with no sun makes golden == backlit) are
     dropped — the board shows CHOICES, not duplicates."""
+    if not current.values and not current.groups:
+        return []          # no writable rig → every "candidate" would be a no-op card
     base = dict(DEFAULT_SEMANTICS)
     have_ref = bool(semantics)
     if have_ref:

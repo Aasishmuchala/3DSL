@@ -585,6 +585,16 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._log(f"dome HDRI → {os.path.basename(path)} ({how})" if how != "failed"
                   else "✗ could not set the dome texture (no dome, or unknown file prop — "
                        "checklist #16)")
+        if how != "failed":
+            # a manual pick outranks the seed — otherwise the next camera switch would
+            # silently re-bind the seed over the artist's explicit choice
+            cam = self._current_camera()
+            e = self.ctrl.session.cameras.get(cam) if cam else None
+            if e is not None and e.seed_hdri:
+                e.seed_hdri = ""
+                self.ctrl.save_session()
+                self._log(f"seed released for {cam} — the manual HDRI takes over "
+                          "(Restore still returns to the pre-seed dome)")
 
     def _seed_dome(self):
         """Reference → HDR pano → dome texture (controller snapshots for Restore)."""

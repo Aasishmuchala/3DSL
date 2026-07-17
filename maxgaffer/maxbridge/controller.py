@@ -775,7 +775,17 @@ class Controller:
                                "— checklist #16)")
         rot_how = sc.write_dome_rotation(dome, 0.0)
         e.seed_hdri = out
-        if prev_seed and prev_seed != out and os.path.basename(prev_seed).startswith("seed_"):
+        # a matched state's dome.rotation_deg was tuned against the REPLACED texture —
+        # re-applying it on camera switch would spin the world-oriented seed off-axis
+        # (dome sun disc lands rotation° away from the parametric sun)
+        if e.state is not None and "dome.rotation_deg" in e.state.values \
+                and abs(e.state.get("dome.rotation_deg")) > 1e-6:
+            e.state.set("dome.rotation_deg", 0.0)
+            log("dome seed: saved state's dome rotation reset to 0 (it was tuned "
+                "against the replaced HDRI)")
+        if prev_seed and prev_seed != out \
+                and os.path.basename(prev_seed).startswith("seed_") \
+                and not _seed_still_referenced(self.session, prev_seed, exclude=e):
             try:
                 os.remove(prev_seed)           # superseded seed — don't litter the run dir
             except OSError:
@@ -968,6 +978,18 @@ class Controller:
         self._run_dir = d
         prune_old_runs(parent, keep=int(self.cfg.keep_runs))
         return d
+
+
+def _seed_still_referenced(session, path: str, exclude=None) -> bool:
+    """True if any OTHER camera's seed or pre-seed snapshot points at ``path``. Two
+    cameras share one scene-global dome, so B's pre_seed can legitimately be A's seed
+    file — deleting it on A's re-seed would turn B's Restore into a black dome."""
+    for entry in session.cameras.values():
+        if entry is exclude:
+            continue
+        if entry.seed_hdri == path or (entry.pre_seed or {}).get("file") == path:
+            return True
+    return False
 
 
 def prune_old_runs(parent_dir: str, keep: int) -> int:

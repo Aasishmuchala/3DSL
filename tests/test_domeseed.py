@@ -285,6 +285,23 @@ def test_scenarios_empty_rig_returns_empty_board():
     assert scenarios.build_scenarios(None, LightingState(), 0.0) == []
 
 
+def test_seed_delete_guard_protects_other_cameras():
+    """Two cameras share ONE dome: B's pre_seed snapshot can legitimately point at A's
+    seed file. A's re-seed must not delete a file B still needs for Restore."""
+    from maxgaffer.core.session import Session
+    from maxgaffer.maxbridge.controller import _seed_still_referenced
+
+    s = Session()
+    a = s.entry("CamA")
+    b = s.entry("CamB")
+    a.seed_hdri = "/runs/seed_CamA_11112222.hdr"
+    b.pre_seed = {"file": "/runs/seed_CamA_11112222.hdr", "rotation": 40.0}
+    assert _seed_still_referenced(s, a.seed_hdri, exclude=a)      # B holds it — keep
+    b.pre_seed = {}
+    b.seed_hdri = "/runs/seed_CamB_33334444.hdr"
+    assert not _seed_still_referenced(s, a.seed_hdri, exclude=a)  # nobody else — free
+
+
 def test_api_as_state_accepts_both_forms_and_rejects_junk():
     """A LightingState fed to from_dict would 'succeed' as an EMPTY state (its .get
     method answers 'values' with 0.0) and silently wipe the camera on adopt."""

@@ -120,6 +120,10 @@ class FakeController:
         self.calls.append(("adopt", camera_name, score))
         return []
 
+    def set_dome_hdri(self, path):
+        self.calls.append(("set_dome_hdri", path))
+        return "texmap.HDRIMapName"
+
     # misc ----------------------------------------------------------
     def restore_pre_match(self, camera_name):
         self.calls.append(("restore", camera_name))
@@ -326,6 +330,18 @@ def test_scenario_dialog_preselects_best_and_reports_choice(dock, app):
     assert dlg.chosen == 1                      # measured winner preselected
     dlg._cards[0].click()                       # user changes their mind
     assert dlg.chosen == 0
+
+
+def test_manual_hdri_pick_releases_the_seed(dock, monkeypatch, tmp_path):
+    """Round-2 regression: _rebind_seed re-binds on every camera switch, so a manual
+    HDRI pick must clear the camera's seed or the artist's choice silently reverts."""
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "sky.hdr"), "")))
+    dock.ctrl.session.cameras["CamA"].seed_hdri = "/runs/seed_CamA_11112222.hdr"
+    dock._pick_hdri()
+    assert any(c[0] == "set_dome_hdri" for c in dock.ctrl.calls)
+    assert dock.ctrl.session.cameras["CamA"].seed_hdri == ""
+    assert "seed released" in dock.log.toPlainText()
 
 
 def test_settings_tuning_persists(dock, app):

@@ -57,8 +57,9 @@ def main():
     from maxgaffer.maxbridge import scene as sc
     from maxgaffer.maxbridge import vantage as vt
     from maxgaffer.maxbridge.apply import apply_state, capture_baselines, read_state
-    from maxgaffer.maxbridge.exposure import (CAM_FNUM, CAM_ISO, CAM_SHUTTER, EC_EV,
-                                              EC_WB_KELVIN, ExposureHost)
+    from maxgaffer.maxbridge.exposure import (CAM_FNUM, CAM_ISO, CAM_SHUTTER_SECONDS,
+                                              CAM_SHUTTER_SPEED, EC_EV, EC_WB_KELVIN,
+                                              ExposureHost)
     from maxgaffer.maxbridge.render import render_frame
     from pymxs import runtime as rt
 
@@ -104,8 +105,11 @@ def main():
         check("D2", "EC property names", lambda: matched(host.ec, {
             "ev": EC_EV, "wb_kelvin": EC_WB_KELVIN}))
     elif host.kind == "physical_cam":
+        # one of the two shutter conventions will be MISSING — that identifies the camera
+        # generation (native Physical = seconds, legacy VRayPhysical = 1/s speed)
         check("D2", "camera exposure property names", lambda: matched(host.cam, {
-            "iso": CAM_ISO, "f": CAM_FNUM, "shutter": CAM_SHUTTER}))
+            "iso": CAM_ISO, "f": CAM_FNUM, "shutter_s": CAM_SHUTTER_SECONDS,
+            "shutter_speed": CAM_SHUTTER_SPEED}))
 
     # ---------- snapshot before anything mutates
     snapshot = read_state(rig, baselines, cam)
@@ -220,6 +224,61 @@ def main():
 
         check("K/#13", "sun-off vs VRaySky", sun_off_sky)
 
+        # ---------- Q dome seed end-to-end (#17, v0.9) — fully offline, no gateway
+        if rig["dome"] is not None and cam is not None:
+            def dome_seed():
+                from maxgaffer.core import domeseed, hdr_min
+
+                pre_file = sc.get_dome_texture(rig["dome"])
+                pre_rot = sc.read_dome_rotation(rig["dome"])
+                ref_png = os.path.join(tmp, "base.png")
+                if not os.path.exists(ref_png) and not render_frame(cam, ref_png, 160, 90):
+                    raise RuntimeError("no probe render to seed from")
+                out = os.path.join(tmp, "spike_seed.hdr")
+                meta = domeseed.build_seed(
+                    out, ref_path=ref_png,
+                    semantics={"sky": "clear", "sun_active": True,
+                               "time_of_day": "afternoon"},
+                    cam_yaw_deg=cams[0]["yaw_deg"] if cams else 0.0,
+                    sun_az_deg=210.0, sun_alt_deg=35.0, out_w=128, out_h=64)
+                if meta is None:
+                    raise RuntimeError("build_seed returned None (reference unreadable)")
+                if hdr_min.read_hdr(out) is None:
+                    raise RuntimeError("written .hdr failed round-trip read")
+                try:
+                    how = sc.set_dome_texture(rig["dome"], out)
+                    if how == "failed":
+                        raise RuntimeError("dome texture not writable (#16)")
+                    bound = sc.get_dome_texture(rig["dome"])
+                    seeded = render_frame(cam, os.path.join(tmp, "seeded.png"), 160, 90)
+                finally:   # the artist's dome comes back even if the check raises
+                    if pre_file:
+                        sc.set_dome_texture(rig["dome"], pre_file)
+                    else:
+                        sc.set_prop(rig["dome"], sc.DOME_TEX_ON, False)
+                    sc.write_dome_rotation(rig["dome"], pre_rot)
+                if bound != out:
+                    raise RuntimeError(f"texture readback mismatch: {bound!r}")
+                if not seeded:
+                    raise RuntimeError("render with seeded dome failed — check .hdr "
+                                       "load / gamma (#17)")
+                return (f"seed {meta['width']}x{meta['height']} bound via {how}, "
+                        "rendered ✓ (u-origin #18 stays a visual check)")
+
+            check("Q/#17", "dome seed end-to-end (v0.9)", dome_seed)
+
+        # ---------- R scenario board core (v0.9) — pure, no renders
+        def board_core():
+            from maxgaffer.core import scenarios as scen
+
+            board = scen.build_scenarios(None, snapshot,
+                                         cams[0]["yaw_deg"] if cams else 0.0)
+            if not board:
+                raise RuntimeError("no candidates from a live rig — rig read is empty?")
+            return f"{len(board)} candidates: " + ", ".join(b["key"] for b in board)
+
+        check("R", "scenario board candidates (v0.9)", board_core)
+
     finally:
         apply_state(rig, baselines, snapshot, cam)   # always leave the scene as found
 
@@ -274,9 +333,12 @@ def main():
         print("CHECKPOINT 0: GREEN — run a real match (tasks/plan.md P1).")
 
 
+# pymxs alone decides the "inside Max?" question — main() runs OUTSIDE this guard so a
+# genuine coding error (a stale import once printed this exact message ON the box)
+# tracebacks loudly instead of masquerading as "you're not inside Max"
 try:
     import pymxs  # noqa: F401
-
-    main()
 except ImportError:
     print("onbox_spikes.py must run INSIDE 3ds Max (pymxs not available here).")
+else:
+    main()

@@ -103,10 +103,16 @@ def restore_draft() -> List[str]:
     r = _renderer()
     if r is not None and isinstance(snapshot, dict):
         for name, value in snapshot.items():
-            current = get_prop(r, (name,))
-            restored = set_prop(
-                r, (name,),
-                type(current)(value) if isinstance(current, int) else float(value))
+            # per-prop isolation: if the RENDERER changed between crash and relaunch,
+            # a prop can be gone (current=None) — type(None)(value) used to raise here,
+            # abandoning the remaining restores AND the snapshot file
+            try:
+                current = get_prop(r, (name,))
+                coerced = (type(current)(value) if isinstance(current, int)
+                           else float(value))
+                restored = set_prop(r, (name,), coerced)
+            except Exception:  # noqa: BLE001 one lost prop must not strand the rest
+                restored = None
             lines.append(f"draft: restored {name} → {value:g}"
                          if restored else f"draft: could not restore {name}")
     try:

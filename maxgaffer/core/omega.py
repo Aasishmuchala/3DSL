@@ -113,7 +113,7 @@ def call(
         "anthropic-version": "2023-06-01",
         # Cloudflare in front of the gateway rejects UA-less urllib (error 1010) —
         # found by live fire 2026-07-16; identify ourselves like any honest API client
-        "user-agent": "MaxGaffer/0.3.1 (+python-urllib)",
+        "user-agent": "MaxGaffer (+python-urllib)",
         "accept": "application/json",
     }
     last = "gateway request failed"

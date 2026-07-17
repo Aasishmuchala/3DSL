@@ -56,7 +56,10 @@ expected groups; no ⚠ property warnings when moving each RIG slider once.
    sessions run V-Ray CPU or link closed during MATCH (workflow note, no code).
 5. Optional: point Settings → system python at a Pillow venv; `metrics_cli some.jpg` prints
    stats.
-### Spike E — dome seed + scenario board (~10 min, manual) · checklist #17 #18 (v0.9)
+### Spike E — dome seed + scenario board (~10 min) · checklist #17 #18 (v0.9)
+`onbox_spikes.py` now runs the core automatically: **Q/#17** seeds from a probe render,
+round-trips the .hdr, binds it, renders under it, and restores the artist's dome in a
+finally; **R** builds the scenario candidates from the live rig. Manual leftovers below.
 1. Bind any reference → RIG → **Seed dome**: `seed_<cam>.hdr` lands in the camera's run
    folder, the dome renders it (VRayBitmap reads our stdlib RGBE — verify no black dome /
    no gamma double-up; the file is linear, so the texmap should NOT apply sRGB de-gamma).

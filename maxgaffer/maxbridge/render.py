@@ -33,8 +33,25 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
         except Exception:
             pass
         old_w, old_h = int(rt.renderWidth), int(rt.renderHeight)
-        bm = rt.render(camera=camera, outputwidth=int(width), outputheight=int(height),
-                       vfb=False, quiet=True)
+        # render()'s size-arg spelling varies across Max releases — a single spelling here
+        # would be a single point of failure for EVERY loop render. Layered candidates:
+        # outputwidth/height kwargs → outputSize:Point2 → the globals (restored in finally).
+        bm = None
+        try:
+            bm = rt.render(camera=camera, outputwidth=int(width),
+                           outputheight=int(height), vfb=False, quiet=True)
+        except Exception:
+            bm = None
+        if bm is None:
+            try:
+                bm = rt.render(camera=camera,
+                               outputSize=rt.Point2(int(width), int(height)),
+                               vfb=False, quiet=True)
+            except Exception:
+                bm = None
+        if bm is None:
+            rt.renderWidth, rt.renderHeight = int(width), int(height)
+            bm = rt.render(camera=camera, vfb=False, quiet=True)
         if bm is None:
             return None
         bm.filename = out_path

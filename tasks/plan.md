@@ -56,6 +56,18 @@ expected groups; no ⚠ property warnings when moving each RIG slider once.
    sessions run V-Ray CPU or link closed during MATCH (workflow note, no code).
 5. Optional: point Settings → system python at a Pillow venv; `metrics_cli some.jpg` prints
    stats.
+### Spike E — dome seed + scenario board (~10 min, manual) · checklist #17 #18 (v0.9)
+1. Bind any reference → RIG → **Seed dome**: `seed_<cam>.hdr` lands in the camera's run
+   folder, the dome renders it (VRayBitmap reads our stdlib RGBE — verify no black dome /
+   no gamma double-up; the file is linear, so the texmap should NOT apply sRGB de-gamma).
+2. **u-origin offset**: seed a scene whose reference has an obvious sun; check the pano's
+   sun disc lights from the expected compass direction. If V-Ray's spherical u=0 is not
+   north, note the constant offset here — the fix is one baked rotation in
+   `controller.seed_dome` (rotation currently zeroed) and the loop absorbs it either way.
+3. **Restore pre-match** after a seed: previous HDRI file + rotation return (a dome that
+   had NO texture gets its texmap disabled instead — confirm it doesn't render black).
+4. **BOARD** on the same camera: 5-6 candidates render, scores shown when a reference is
+   bound, ADOPT applies + saves, "Keep current light" leaves the scene untouched.
 **→ CHECKPOINT 0: preflight all-green inside Max. Commit "on-box verified" with the diff.**
 
 ## P1 — First live match (MVP smoke, ~1 hr)

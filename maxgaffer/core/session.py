@@ -38,6 +38,8 @@ class CameraEntry:
     semantics: Dict = field(default_factory=dict)   # cached ANALYZE result for the reference
     pre_match: Optional[LightingState] = None       # the light BEFORE the last match run
     notes: List[str] = field(default_factory=list)  # director's notes, newest last
+    seed_hdri: str = ""                             # generated dome-seed .hdr ("" = none)
+    pre_seed: Dict = field(default_factory=dict)    # dome texture/rotation before seeding
 
     def to_dict(self) -> Dict:
         return {
@@ -49,6 +51,8 @@ class CameraEntry:
             "semantics": self.semantics,
             "pre_match": self.pre_match.to_dict() if self.pre_match else None,
             "notes": list(self.notes),
+            "seed_hdri": self.seed_hdri,
+            "pre_seed": dict(self.pre_seed),
         }
 
     @classmethod
@@ -64,6 +68,8 @@ class CameraEntry:
             semantics=d.get("semantics") if isinstance(d.get("semantics"), dict) else {},
             pre_match=LightingState.from_dict(pre) if isinstance(pre, dict) else None,
             notes=[str(x) for x in (d.get("notes") or []) if isinstance(x, str)],
+            seed_hdri=str(d.get("seed_hdri") or ""),
+            pre_seed=d.get("pre_seed") if isinstance(d.get("pre_seed"), dict) else {},
         )
 
 

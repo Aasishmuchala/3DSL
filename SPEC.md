@@ -141,3 +141,28 @@ perspective matching · multi-dome · exact HDRI *content* matching (rotation/in
   visual acceptance in ≤2 runs; restore + per-camera recall verified.
 - **C2 (shot board):** a multi-camera scene batch-renders overnight through
   vantage_console, every shot under its own matched light, zero manual steps after launch.
+
+## 10. v0.9 addendum — dome seed + scenario board (amends §8)
+
+§8's "no HDRI content matching" is REVISED: v0.9 *generates* dome content from the
+reference (it still never edits a user's own HDRI files). Locked decisions:
+
+- **Seed is deterministic and local.** `core/domeseed.py` synthesizes the pano
+  (mirror-fold at a 180-divisor FOV for back-seam continuity, sky/ground extension
+  constant at the poles, wrap-aware blur, mean-luminance normalization) and
+  `core/hdr_min.py` writes real Radiance RGBE (new-style RLE in the 8..32767 width
+  band — strict loaders assume it). No model, no cloud, byte-reproducible.
+- **World-oriented pano; rotation stays genome-owned.** Column azimuth 0 = north; the
+  dome's rotation is zeroed at bind and remains a live loop parameter (any V-Ray u-origin
+  constant is measured once at Spike E and absorbed either way).
+- **Generative panos enter through the same gate.** `build_seed(pano_path=…)` ingests an
+  external equirect (DiffusionLight-class estimation) via identical orient/inject/write —
+  the upgrade seam is a file path, never a bundled ML dependency.
+- **Restore stays honest.** The dome's pre-seed texture/rotation snapshots once into the
+  session (`pre_seed`); Restore re-binds it (texmap disabled when there was none) and
+  clears the snapshot.
+- **Board candidates speak semantics, not genome.** Variants are ANALYZE-vocabulary
+  overrides through `rules.initial_state` — one semantics→state mapping to maintain, and
+  an on-box craft fix corrects first guess and board together. The board probe-renders,
+  scores via the critic only when a reference is bound, re-applies the found state on
+  exit, and ADOPT is an ordinary `record_match`.

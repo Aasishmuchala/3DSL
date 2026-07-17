@@ -261,6 +261,13 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.btn_match_all.setToolTip("Match every camera that has a reference bound.")
         self.btn_match_all.clicked.connect(self._start_match_all)
         bar.addWidget(self.btn_match_all)
+        self.btn_board = QtWidgets.QPushButton("BOARD")
+        self.btn_board.setToolTip(
+            "Scenario board — render candidate rigs (golden, overcast, backlit, north "
+            "light, dusk practicals…), critic-scored against the reference when one is "
+            "bound. Adopt one, then MATCH/REFINE from it.")
+        self.btn_board.clicked.connect(self._open_scenarios)
+        bar.addWidget(self.btn_board)
         self.btn_cancel = QtWidgets.QPushButton("✕")
         self.btn_cancel.setToolTip("Cancel after the current step.")
         self.btn_cancel.setEnabled(False)
@@ -332,6 +339,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         grow.addStretch(1)
         for label, slot in (("Read scene", self.rebuild_rig_controls),
                             ("HDRI…", self._pick_hdri),
+                            ("Seed dome", self._seed_dome),
                             ("Save preset…", self._save_preset),
                             ("Load preset…", self._load_preset)):
             b = QtWidgets.QPushButton(label)
@@ -578,6 +586,75 @@ class MaxGafferDock(QtWidgets.QWidget):
                   else "✗ could not set the dome texture (no dome, or unknown file prop — "
                        "checklist #16)")
 
+    def _seed_dome(self):
+        """Reference → HDR pano → dome texture (controller snapshots for Restore)."""
+        if self._busy:
+            return
+        cam = self._current_camera()
+        if not cam:
+            self._log("select a camera first")
+            return
+        e = self.ctrl.session.cameras.get(cam)
+        if not (e and e.reference):
+            self._log("bind a reference image first — the seed is built FROM it")
+            return
+        self._busy = True
+        try:
+            meta = self.ctrl.seed_dome(cam, log=self._log)
+            sun = (meta or {}).get("sun")
+            self._log("✓ dome seeded"
+                      + (f" — sun disc at az {sun['azimuth_deg']:.0f}° / "
+                         f"alt {sun['altitude_deg']:.0f}°" if sun
+                         else " (no disc — overcast/night reference)"))
+            self.rebuild_rig_controls()
+        except Exception as err:  # noqa: BLE001
+            self._log(f"✗ seed: {err}")
+        finally:
+            self._busy = False
+
+    # ================================================================= scenario board
+    def _open_scenarios(self):
+        if self._busy:
+            return
+        cam = self._current_camera()
+        if not cam:
+            self._log("select a camera first")
+            return
+        self._busy = True
+        self._cancel = False
+        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
+            b.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self._log(f"— scenario board: {cam} —")
+        results = []
+        try:
+            results = self.ctrl.run_scenarios(cam, log=self._log,
+                                              should_cancel=lambda: self._cancel)
+        except Exception as err:  # noqa: BLE001
+            self._log(f"✗ board: {err}")
+        finally:
+            self._busy = False
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
+                b.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
+        if not results:
+            return
+        dlg = ScenarioBoardDialog(results, self)
+        if dlg.exec() and dlg.chosen is not None:
+            c = results[dlg.chosen]
+            try:
+                for w in self.ctrl.adopt_scenario(cam, c["state"], c.get("score")):
+                    self._log("⚠ " + w)
+                self._log(f"✓ adopted scenario: {c['label']}"
+                          + (f" ({c['score']:.1f})" if c.get("score") is not None else ""))
+                self._set_match_thumb(c.get("render"))
+                self.rebuild_rig_controls()
+                self.refresh_cameras()
+            except Exception as err:  # noqa: BLE001
+                self._log(f"✗ adopt: {err}")
+        else:
+            self._log("board closed — current light kept (it was re-applied already)")
+
     def _save_preset(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save lighting preset", "", "MaxGaffer preset (*.json)")
@@ -632,7 +709,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             return
         self._busy = True
         self._cancel = False
-        for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
             b.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         mode = self.cmb_mode.currentIndex()          # 0 standard · 1 deep · 2 loop-only
@@ -675,7 +752,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         finally:
             self._busy = False
             self._ab_on_pre = False
-            for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
                 b.setEnabled(True)
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
@@ -698,7 +775,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             return
         self._busy = True
         self._cancel = False
-        for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
             b.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.cfg.draft_sampler = self.act_draft.isChecked()
@@ -716,7 +793,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         finally:
             self._busy = False
             self._ab_on_pre = False
-            for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
                 b.setEnabled(True)
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
@@ -749,7 +826,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             return
         self._busy = True
         self._cancel = False
-        for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
             b.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self._log(f"— refine: {cam} — “{note}”")
@@ -774,7 +851,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         finally:
             self._busy = False
             self._ab_on_pre = False
-            for b in (self.btn_match, self.btn_match_all, self.btn_refine):
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
                 b.setEnabled(True)
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
@@ -882,6 +959,75 @@ class MaxGafferDock(QtWidgets.QWidget):
             self.cfg.save()
             self.ctrl.cfg = self.cfg
             self._log("settings saved")
+
+
+class ScenarioBoardDialog(QtWidgets.QDialog):
+    """Light Gen, measured: candidate rigs as clickable cards — probe thumbnail, name,
+    and the critic's score when a reference is bound. The best-scoring card comes
+    preselected; ADOPT applies it and saves it as the camera's state."""
+
+    def __init__(self, candidates, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MaxGaffer — scenario board")
+        self.setStyleSheet(STYLE)
+        self.chosen: Optional[int] = None
+        lay = QtWidgets.QVBoxLayout(self)
+        grid = QtWidgets.QGridLayout()
+        grid.setSpacing(12)
+        self._cards: List[QtWidgets.QToolButton] = []
+        for i, c in enumerate(candidates):
+            btn = QtWidgets.QToolButton()
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
+            score = f"   ·   {c['score']:.1f}" if c.get("score") is not None else ""
+            btn.setText(c["label"] + score)
+            btn.setToolTip(c.get("why", ""))
+            render = c.get("render")
+            if render and os.path.exists(render):
+                pix = QtGui.QPixmap(render)
+                if not pix.isNull():
+                    btn.setIcon(QtGui.QIcon(pix))
+                    btn.setIconSize(QtCore.QSize(240, 135))
+            btn.setStyleSheet(
+                f"QToolButton{{background:{PANEL};{_RAISED}border-radius:12px;"
+                f"padding:10px;color:#dcdcdc;}}"
+                f"QToolButton:checked{{background:#f0f0f0;color:#111111;}}")
+            btn.clicked.connect(lambda _=False, idx=i: setattr(self, "chosen", idx))
+            grid.addWidget(btn, i // 3, i % 3)
+            self._cards.append(btn)
+        scored = [i for i, c in enumerate(candidates) if c.get("score") is not None]
+        if scored:                             # preselect the measured winner
+            best = max(scored, key=lambda i: candidates[i]["score"])
+            self._cards[best].setChecked(True)
+            self.chosen = best
+        lay.addLayout(grid)
+        note = QtWidgets.QLabel(
+            "Adopting applies the rig and saves it as this camera's state — MATCH / "
+            "REFINE continue from it. 'Restore' returns to the light before the board.")
+        note.setObjectName("dim")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        row = QtWidgets.QHBoxLayout()
+        ok = QtWidgets.QPushButton("ADOPT")
+        ok.setObjectName("primary")
+        ok.clicked.connect(self._adopt)
+        row.addWidget(ok, 1)
+        keep = QtWidgets.QPushButton("Keep current light")
+        keep.clicked.connect(self.reject)
+        row.addWidget(keep)
+        lay.addLayout(row)
+
+    def _adopt(self):
+        if self.chosen is None:
+            for i, b in enumerate(self._cards):
+                if b.isChecked():
+                    self.chosen = i
+                    break
+        if self.chosen is None:
+            self.reject()
+        else:
+            self.accept()
 
 
 class PlanPreviewDialog(QtWidgets.QDialog):

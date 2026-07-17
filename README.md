@@ -66,6 +66,31 @@ I/O. There is no torch, no OpenCV, no required pip package.
 `python scripts/preflight.py [oc_key]` — anywhere — prints exactly what's ready; run it in
 Max's scripting listener for the pymxs/V-Ray/Vantage/rig checks too.
 
+## Dome seed + scenario board (v0.9)
+
+Two answers to the parametric loop's honest ceiling — the UNREACHABLE reference:
+
+**Seed dome** (RIG row) synthesizes an equirect **HDR panorama from the reference
+itself** — its colors become the ambient light from every direction (mirror-folded around
+the camera's view, sky/ground extended, structure blurred away), and a high-energy sun
+disc is injected at the solved sun position (altitude-matched blackbody tint; overcast
+references get a lifted sky and no disc). The pano is written as a real Radiance `.hdr`
+(pure-stdlib RGBE writer — no Pillow, no numpy), bound to the dome via the existing
+texture path, rotation zeroed (the pano is world-oriented; `dome.rotation_deg` stays a
+live genome param). The previous dome texture/rotation is snapshotted once — **Restore**
+puts it back. This is the deterministic, local, reproducible version of Chaos's AI Mood
+Match (V-Ray 7 U3, SketchUp/Rhino-only) — and for a generative pano, `build_seed`'s
+`pano_path` ingests any external equirect (DiffusionLight-class estimators) through the
+identical orient/inject pipeline.
+
+**BOARD** (action bar) is Light Gen with numbers: up to six candidate rigs — as-analyzed,
+golden low, overcast soft, backlit rim, cool north, practicals at dusk — each built by the
+SAME craft tables as the first guess, probe-rendered, and **critic-scored against the
+reference** when one is bound (reference-less boards render unscored — pick by eye). The
+measured winner comes preselected; **ADOPT** applies it and saves it as the camera's
+state, so MATCH/REFINE continue from it. The board leaves the scene exactly as it found
+it unless you adopt.
+
 ## The conversation loop — refine with director's notes (v0.8)
 
 Watch the match live in Vantage (the link mirrors every apply), and when it isn't right,
@@ -122,15 +147,18 @@ so controlling everything in Max is controlling Vantage's input.
 2. Select a camera → **Load reference…** (JPEG/PNG/WEBP). One reference per camera.
 3. Lock anything that must not move (padlocks list — e.g. lock `exposure.ev` if the
    client's exposure is contractual).
-4. **MATCH LIGHTING**. Watch the log — analysis → first guess → per-iteration score,
+4. Optional openers: **BOARD** renders the scenario candidates (adopt one to start from
+   it), **Seed dome** rebuilds the dome HDRI from the reference (best before a deep match
+   on a reference the stock HDRI can't reach).
+5. **MATCH LIGHTING**. Watch the log — analysis → first guess → per-iteration score,
    analytic EV/WB, the model's changes with reasons. Watch Vantage — every apply syncs.
    Optional **sun sweep first** grid-solves the sun direction before iterating.
-5. Judge it: iteration **thumbnails render inline in the log**, and the **A/B** button flips
+6. Judge it: iteration **thumbnails render inline in the log**, and the **A/B** button flips
    the scene between pre-match (A) and matched (B) — Vantage mirrors the flip. **Restore
    pre-match light** exits the experiment entirely.
-6. Nudge sliders in **RIG** (live-applied → Vantage mirrors). The state is saved per camera;
+7. Nudge sliders in **RIG** (live-applied → Vantage mirrors). The state is saved per camera;
    re-selecting a camera re-applies its light (toggle on the board).
-7. **Finals**: "Render ALL matched (V-Ray)" renders every camera under its own light at
+8. **Finals**: "Render ALL matched (V-Ray)" renders every camera under its own light at
    final resolution, or "Export vrscenes → open Vantage" hands per-camera scenes to
    Vantage's in-app Batch Render queue.
 

@@ -20,7 +20,8 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..core import consensus, critic, feedback, metrics, omega, planner, prompts, rules, scenedigest
+from ..core import (consensus, critic, domeseed, feedback, metrics, omega, planner,
+                    prompts, rules, scenedigest, scenarios as scen)
 from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
@@ -633,6 +634,132 @@ class Controller:
                 log(f"✗ {name}: {err}")
         return results
 
+    # ------------------------------------------------------------------ scenario board
+    def run_scenarios(
+        self,
+        camera_name: str,
+        log: Callable[[str], None],
+        should_cancel: Callable[[], bool] = lambda: False,
+    ) -> List[Dict]:
+        """Render the candidate rigs from core.scenarios at loop res, score each against
+        the reference when one is bound, and leave the scene exactly as it was found.
+        → [{key, label, why, state, render, score}] in board order."""
+        rig = self.rig(refresh=True)
+        cam = sc.get_camera(camera_name)
+        if cam is None:
+            raise RuntimeError(f"camera '{camera_name}' not found in the scene")
+        sc.set_active_camera(camera_name)
+        e = self.session.entry(camera_name)
+        semantics: Optional[Dict] = None
+        if e.reference:
+            try:
+                semantics = self.analyze_reference(camera_name)
+            except Exception as err:  # noqa: BLE001 the board must run reference-less too
+                log(f"⚠ analyze failed ({err}) — board runs on the neutral base")
+        current = ap.read_state(rig, self._baselines, cam)
+        e.pre_match = current.copy()   # explorations must be restorable, same as matches
+        self.save_session()
+        board = scen.build_scenarios(semantics, current, sc.camera_yaw_deg(cam),
+                                     set(e.locks),
+                                     overcast_sun_mode=self.cfg.overcast_sun_mode)
+        if not board:
+            log("no scenario candidates for this rig")
+            return []
+        ref = self.ref_stats(e.reference) if e.reference else None
+        if e.reference and ref is None:
+            log("⚠ reference stats unavailable — board renders without scores")
+        run_dir = self._new_run_dir(camera_name)
+        results: List[Dict] = []
+        for cand in board:
+            if should_cancel():
+                log("scenario board cancelled")
+                break
+            self._apply_logged(rig, cand["state"], cam, log)
+            path = rd.render_frame(
+                cam, os.path.join(run_dir, f"scen_{cand['key']}.png"),
+                self.cfg.loop_width, self.cfg.loop_height)
+            score = None
+            if path:
+                log(f"THUMB::{path}")
+                if ref is not None:
+                    cur = self.stats_for(path)
+                    if cur is not None:
+                        score = critic.score(ref, cur,
+                                             self.cfg.critic_weights or None).score
+            log(f"scenario {cand['label']}: "
+                + (f"{score:.1f}" if score is not None else "unscored")
+                + f" — {cand['why']}")
+            results.append({**cand, "render": path, "score": score})
+        self._apply_logged(rig, current, cam, log)   # leave the scene as it was found
+        return results
+
+    def adopt_scenario(self, camera_name: str, state: LightingState,
+                       score: Optional[float] = None) -> List[str]:
+        """Apply a board candidate and save it as the camera's state — MATCH/REFINE
+        continue from it exactly like any matched state. Returns apply warnings."""
+        warnings = self.apply_state(state, camera_name)
+        self.session.record_match(camera_name, state, score)
+        self.save_session()
+        return warnings
+
+    # ------------------------------------------------------------------ dome seed
+    def seed_dome(self, camera_name: str, log: Callable[[str], None]) -> Dict:
+        """Reference → world-oriented HDR pano → dome texture, rotation zeroed (the pano
+        is world-aligned; dome.rotation_deg stays live for the loop to spin). The dome's
+        previous texture/rotation is snapshotted once for Restore. → build_seed meta."""
+        e = self.session.entry(camera_name)
+        if not e.reference:
+            raise RuntimeError("bind a reference image first — the seed is built from it")
+        rig = self.rig(refresh=True)
+        dome = rig.get("dome")
+        if dome is None:
+            raise RuntimeError("no VRayLight dome in the rig — add one (or let a plan "
+                               "create it), Read scene, then seed")
+        cam = sc.get_camera(camera_name)
+        semantics = self.analyze_reference(camera_name)
+        # sun placement: the camera's matched/current rig wins over the semantics guess
+        st = e.state or ap.read_state(rig, self._baselines, cam)
+        sun_az = sun_alt = None
+        if "sun.azimuth_deg" in st.values and st.get("sun.enabled", 1.0) >= 0.5:
+            sun_az = st.get("sun.azimuth_deg")
+            sun_alt = st.get("sun.altitude_deg", 35.0)
+        if not e.pre_seed:                     # snapshot once; Restore clears it
+            e.pre_seed = {"file": sc.get_dome_texture(dome),
+                          "rotation": sc.read_dome_rotation(dome)}
+        out = os.path.join(self._ensure_run_dir(_safe(camera_name)),
+                           domeseed.seed_filename(camera_name))
+        yaw = sc.camera_yaw_deg(cam) if cam is not None else 0.0
+        src = e.reference
+        if _needs_max_ingest(src):             # EXR/HDR/TIFF ref: Max transcodes first
+            src = self._transcode_ref(e.reference) or src
+        meta = domeseed.build_seed(out, ref_path=src, semantics=semantics,
+                                   cam_yaw_deg=yaw, sun_az_deg=sun_az,
+                                   sun_alt_deg=sun_alt)
+        if meta is None and src == e.reference:   # plain loader failed (JPEG, no Pillow)
+            png = self._transcode_ref(e.reference)
+            if png:
+                meta = domeseed.build_seed(out, ref_path=png, semantics=semantics,
+                                           cam_yaw_deg=yaw, sun_az_deg=sun_az,
+                                           sun_alt_deg=sun_alt)
+        if meta is None:
+            raise RuntimeError("could not read the reference for seeding")
+        how = self.set_dome_hdri(out)
+        if how == "failed":
+            raise RuntimeError("dome texture could not be set (no writable file property "
+                               "— checklist #16)")
+        rot_how = sc.write_dome_rotation(dome, 0.0)
+        e.seed_hdri = out
+        self.save_session()
+        sun = meta.get("sun")
+        log(f"dome seed: {os.path.basename(out)} ({meta['source']}, {how}, "
+            f"rotation zeroed via {rot_how})")
+        if sun:
+            log(f"dome seed: sun disc at az {sun['azimuth_deg']:.0f}° / "
+                f"alt {sun['altitude_deg']:.0f}° ({sun['kelvin']:.0f}K)")
+        elif meta.get("overcast_lift"):
+            log("dome seed: overcast — sky lifted, no disc")
+        return meta
+
     # ------------------------------------------------------------------ presets / HDRI
     def save_preset(self, path: str, camera_name: str = "") -> bool:
         state = self.read_state(camera_name)
@@ -691,6 +818,22 @@ class Controller:
         if not (e and e.pre_match is not None):
             return False
         self.apply_state(e.pre_match, camera_name)
+        if e.pre_seed:                         # a seed replaced the dome texture — undo it
+            dome = self.rig().get("dome")
+            if dome is not None:
+                prev = str(e.pre_seed.get("file") or "")
+                if prev:
+                    sc.set_dome_texture(dome, prev)
+                else:                          # dome had no HDRI: disable texture use
+                    sc.set_prop(dome, sc.DOME_TEX_ON, False)
+                try:
+                    sc.write_dome_rotation(dome,
+                                           float(e.pre_seed.get("rotation") or 0.0))
+                except (TypeError, ValueError):
+                    pass
+            e.pre_seed = {}
+            e.seed_hdri = ""
+            self.save_session()
         return True
 
     # ------------------------------------------------------------------ vantage

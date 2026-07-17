@@ -102,6 +102,24 @@ class FakeController:
         self.calls.append(("match_all", do_sweep))
         return {"CamA": "98.2"}
 
+    def seed_dome(self, camera_name, log):
+        self.calls.append(("seed_dome", camera_name))
+        log("dome seed: seed_cam.hdr (reference, texmap.HDRIMapName, rotation zeroed)")
+        return {"path": "/tmp/seed.hdr", "source": "reference",
+                "sun": {"azimuth_deg": 120.0, "altitude_deg": 30.0, "kelvin": 4300.0}}
+
+    def run_scenarios(self, camera_name, log, should_cancel=lambda: False):
+        self.calls.append(("run_scenarios", camera_name))
+        log("board rendered")
+        return [{"key": "golden_low", "label": "Golden low sun", "why": "warm rake",
+                 "state": demo_state(), "render": self.best_render, "score": 77.7},
+                {"key": "overcast_soft", "label": "Overcast soft", "why": "sky key",
+                 "state": demo_state(), "render": self.best_render, "score": 61.0}]
+
+    def adopt_scenario(self, camera_name, state, score=None):
+        self.calls.append(("adopt", camera_name, score))
+        return []
+
     # misc ----------------------------------------------------------
     def restore_pre_match(self, camera_name):
         self.calls.append(("restore", camera_name))
@@ -257,6 +275,57 @@ def test_finals_button_uses_vray_backend(dock, monkeypatch):
     dock.ctrl.session.record_match("CamA", demo_state(), 98.0)
     dock._render_finals(selected_only=True)
     assert ("finals", ("CamA",)) in dock.ctrl.calls
+
+
+def test_seed_dome_action_reaches_controller(dock):
+    dock._seed_dome()
+    assert ("seed_dome", "CamA") in dock.ctrl.calls
+    assert "dome seeded" in dock.log.toPlainText()
+    assert not dock._busy
+
+
+def test_seed_dome_needs_reference(dock):
+    dock.ctrl.session.cameras["CamA"].reference = ""
+    dock._seed_dome()
+    assert "seed_dome" not in names(dock)
+    assert "bind a reference" in dock.log.toPlainText()
+
+
+def test_scenario_board_adopts_measured_winner(dock, monkeypatch):
+    from maxgaffer.ui import dock as dockmod
+
+    # dialog auto-accepts with its preselection — the best-scoring card
+    monkeypatch.setattr(dockmod.ScenarioBoardDialog, "exec", lambda self: True)
+    dock._open_scenarios()
+    assert ("run_scenarios", "CamA") in dock.ctrl.calls
+    adopt = next(c for c in dock.ctrl.calls if c[0] == "adopt")
+    assert adopt[1] == "CamA" and adopt[2] == 77.7   # 77.7 beats 61.0 — winner preselected
+    assert dock.btn_match.isEnabled() and not dock._busy
+
+
+def test_scenario_board_keep_current_adopts_nothing(dock, monkeypatch):
+    from maxgaffer.ui import dock as dockmod
+
+    monkeypatch.setattr(dockmod.ScenarioBoardDialog, "exec", lambda self: False)
+    dock._open_scenarios()
+    assert ("run_scenarios", "CamA") in dock.ctrl.calls
+    assert not any(c[0] == "adopt" for c in dock.ctrl.calls)
+    assert dock.btn_board.isEnabled()
+
+
+def test_scenario_dialog_preselects_best_and_reports_choice(dock, app):
+    from maxgaffer.ui.dock import ScenarioBoardDialog
+
+    cands = [{"key": "a", "label": "A", "why": "", "state": demo_state(),
+              "render": None, "score": 50.0},
+             {"key": "b", "label": "B", "why": "", "state": demo_state(),
+              "render": None, "score": 88.0},
+             {"key": "c", "label": "C", "why": "", "state": demo_state(),
+              "render": None, "score": None}]
+    dlg = ScenarioBoardDialog(cands)
+    assert dlg.chosen == 1                      # measured winner preselected
+    dlg._cards[0].click()                       # user changes their mind
+    assert dlg.chosen == 0
 
 
 def test_settings_tuning_persists(dock, app):

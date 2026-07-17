@@ -24,7 +24,8 @@ from .maxbridge import config as _config
 from .maxbridge.controller import Controller
 
 __all__ = ["match_camera", "match_all_cameras", "apply_camera_state",
-           "render_cameras", "export_vrscenes_for_vantage", "get_controller"]
+           "render_cameras", "export_vrscenes_for_vantage", "get_controller",
+           "seed_dome", "scenario_board", "adopt_scenario"]
 
 _shared: Optional[Controller] = None
 
@@ -89,6 +90,42 @@ def apply_camera_state(camera_name: str) -> List[str]:
     if not (e and e.state is not None):
         raise RuntimeError(f"no saved lighting state for camera '{camera_name}'")
     return ctrl.apply_state(e.state, camera_name)
+
+
+def seed_dome(
+    camera_name: str,
+    reference_path: str = "",
+    log: Callable[[str], None] = lambda m: None,
+    config_overrides: Optional[Dict] = None,
+) -> Dict:
+    """Build a reference-derived HDR pano and bind it to the dome (rotation zeroed;
+    previous dome texture snapshotted — restore_pre_match puts it back). → seed meta."""
+    ctrl = get_controller(config_overrides)
+    if reference_path:
+        ctrl.session.set_reference(camera_name, reference_path)
+        ctrl.save_session()
+    return ctrl.seed_dome(camera_name, log=log)
+
+
+def scenario_board(
+    camera_name: str,
+    log: Callable[[str], None] = lambda m: None,
+    should_cancel: Callable[[], bool] = lambda: False,
+    config_overrides: Optional[Dict] = None,
+) -> List[Dict]:
+    """Render + score the candidate rigs (reference optional). The scene is left as it
+    was found. → [{key, label, why, state, render, score}]."""
+    return get_controller(config_overrides).run_scenarios(camera_name, log=log,
+                                                          should_cancel=should_cancel)
+
+
+def adopt_scenario(camera_name: str, state_dict: Dict,
+                   score: Optional[float] = None) -> List[str]:
+    """Apply a board candidate's state dict and save it as the camera's state."""
+    from .core.genome import LightingState
+
+    ctrl = get_controller()
+    return ctrl.adopt_scenario(camera_name, LightingState.from_dict(state_dict), score)
 
 
 def render_cameras(

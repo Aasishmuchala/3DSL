@@ -294,6 +294,15 @@ def write_dome_rotation(dome, degrees_: float) -> str:
         return "failed"
 
 
+def get_dome_texture(dome) -> str:
+    """Current HDRI file path on the dome's texmap ("" = no texmap / no file)."""
+    tex = get_prop(dome, ("texmap",))
+    if tex is None:
+        return ""
+    v = get_prop(tex, DOME_TEX_FILE)
+    return str(v) if v else ""
+
+
 def set_dome_texture(dome, hdri_path: str) -> str:
     """Point the dome light at an HDRI file, creating a VRayBitmap texmap if the dome has
     none. Returns how it was done ('failed' = nothing writable found)."""

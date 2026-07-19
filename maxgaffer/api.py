@@ -13,7 +13,8 @@ Contract notes:
   * per-camera state/reference/locks persist in the scene's session sidecar exactly as if
     driven from the dock, so the UI and API stay interchangeable mid-project;
   * ``config_overrides`` mutate the shared controller's config for the REST OF THE SESSION
-    (nothing is written to disk) — pass them once up front.
+    (nothing is written to disk) — pass them once up front. Values are coerced to each
+    field's existing type; anything uncoercible raises TypeError immediately.
 """
 
 from __future__ import annotations
@@ -31,15 +32,48 @@ __all__ = ["match_camera", "match_all_cameras", "apply_camera_state",
 _shared: Optional[Controller] = None
 
 
+def _coerce_overrides(cfg, overrides: Dict) -> None:
+    """Type-sane config overrides: each value is coerced to the config field's existing
+    type, or rejected with a clear TypeError. A raw setattr would let e.g. a STRING
+    ``loop_width`` into the shared controller, where it only explodes deep inside a
+    later render — far from the call that caused it."""
+    for k, v in overrides.items():
+        if not hasattr(cfg, k):
+            continue
+        current = getattr(cfg, k)
+        try:
+            if isinstance(current, bool):          # before int: bool IS an int
+                if not isinstance(v, bool):
+                    raise TypeError("expected a bool")
+                coerced = v
+            elif isinstance(current, int):
+                coerced = int(v)
+            elif isinstance(current, float):
+                coerced = float(v)
+            elif isinstance(current, str):
+                if not isinstance(v, str):
+                    raise TypeError("expected a string")
+                coerced = v
+            elif isinstance(current, dict):
+                if not isinstance(v, dict):
+                    raise TypeError("expected a dict")
+                coerced = v
+            else:
+                coerced = v
+        except (TypeError, ValueError):
+            raise TypeError(
+                f"config_overrides[{k!r}] must fit the config field's type "
+                f"({type(current).__name__}); got {v!r}") from None
+        setattr(cfg, k, coerced)
+
+
 def get_controller(config_overrides: Optional[Dict] = None) -> Controller:
     """One shared Controller (session/rig caches stay warm across API calls)."""
     global _shared
     if _shared is None:
         _shared = Controller(_config.load())
     if config_overrides:
-        for k, v in config_overrides.items():
-            if hasattr(_shared.cfg, k):
-                setattr(_shared.cfg, k, v)
+        _coerce_overrides(_shared.cfg, config_overrides)
     return _shared
 
 
@@ -59,7 +93,7 @@ def match_camera(
     ctrl = get_controller(config_overrides)
     if reference_path:
         ctrl.session.set_reference(camera_name, reference_path)
-        ctrl.save_session()
+        ctrl._save_or_warn(log)
     result = ctrl.run_match(camera_name, log=log, should_cancel=should_cancel,
                             locks=locks, do_sweep=sweep, deep=deep)
     return {
@@ -104,7 +138,7 @@ def seed_dome(
     ctrl = get_controller(config_overrides)
     if reference_path:
         ctrl.session.set_reference(camera_name, reference_path)
-        ctrl.save_session()
+        ctrl._save_or_warn(log)
     return ctrl.seed_dome(camera_name, log=log)
 
 

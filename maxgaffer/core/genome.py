@@ -15,9 +15,12 @@ Pure python, zero pymxs — the bridge translates a LightingState into scene wri
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 GROUP_PREFIX = "group."          # dynamic artificial-light groups: "group.<name>"
 GROUP_BOUNDS = (0.0, 10.0)       # multiplier factor bounds for a light group
@@ -73,15 +76,37 @@ def spec_for(key: str) -> Optional[ParamSpec]:
 
 
 def _wrap_deg(v: float) -> float:
+    if not math.isfinite(v):
+        return 0.0            # fmod(inf/nan) raises or propagates NaN — 0° is the sane fallback
     v = math.fmod(v, 360.0)
     return v + 360.0 if v < 0 else v
 
 
+def _coercible_number(v: Any) -> bool:
+    """True if ``v`` loads as a finite float — the sidecar is human-editable and Python's
+    json accepts NaN/Infinity literals, so neither is guaranteed."""
+    try:
+        return math.isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
 def clamp(key: str, value: float) -> float:
+    """Bound ``value`` to the spec. Unknown keys raise KeyError (programmer error);
+    non-numeric/non-finite VALUES are coerced to a bounded fallback instead of raising —
+    a corrupt sidecar/preset must never crash the loop or reach the scene."""
     spec = spec_for(key)
     if spec is None:
         raise KeyError(f"unknown lighting parameter: {key}")
-    v = float(value)
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = math.nan
+    if not math.isfinite(v):
+        fallback = 0.0 if spec.wrap else spec.lo
+        log.warning("genome: %r value %r is not a finite number — using %s",
+                    key, value, fallback)
+        return fallback
     if spec.wrap:
         return _wrap_deg(v)
     return min(spec.hi, max(spec.lo, v))
@@ -146,20 +171,35 @@ class LightingState:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "LightingState":
+        """Load from json. Corrupt entries are DROPPED per-key (never raise): one bad
+        value in a hand-edited sidecar must not take the rest of the state with it."""
         st = cls()
         for k, v in (d.get("values") or {}).items():
-            if spec_for(k) is not None:
-                st.values[k] = clamp(k, v)
+            if spec_for(k) is None:
+                continue
+            if not _coercible_number(v):
+                log.warning("genome: dropping %r value %r from loaded state — not a "
+                            "finite number", k, v)
+                continue
+            st.values[k] = clamp(k, v)
         for g, v in (d.get("groups") or {}).items():
+            if not _coercible_number(v):
+                log.warning("genome: dropping group %r value %r from loaded state — "
+                            "not a finite number", g, v)
+                continue
             st.groups[str(g)] = clamp(GROUP_PREFIX + str(g), v)
         return st
 
     # -------------------------------------------------------------- diff
     def diff(self, other: "LightingState") -> Dict[str, Tuple[float, float]]:
-        """{key: (mine, theirs)} for every key whose value meaningfully differs."""
+        """{key: (mine, theirs)} for every key whose value meaningfully differs.
+        A key missing on one side is compared against its NEUTRAL value (1.0 for
+        ``group.*`` — as-authored), so a light layer added/removed between snapshot
+        and report doesn't hallucinate a 0.00 → 1.00 change the tool never made."""
         out: Dict[str, Tuple[float, float]] = {}
         for key in sorted(set(self.keys()) | set(other.keys())):
-            a, b = self.get(key), other.get(key)
+            neutral = 1.0 if key.startswith(GROUP_PREFIX) else 0.0
+            a, b = self.get(key, neutral), other.get(key, neutral)
             if abs(a - b) > 1e-4:
                 out[key] = (a, b)
         return out

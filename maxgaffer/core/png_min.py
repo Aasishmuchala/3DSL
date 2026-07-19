@@ -18,6 +18,12 @@ from typing import List, Optional, Tuple
 
 _SIG = b"\x89PNG\r\n\x1a\n"
 
+# Decompression-bomb guards: a hostile "reference" can declare huge-but-legal geometry and
+# inflate to gigabytes on Max's MAIN thread (loop stats can never fail — or freeze). Cap the
+# declared dimensions and bound the decompressed payload BEFORE allocating anything.
+_MAX_DIM = 16384
+_MAX_RAW_BYTES = 256 * 1024 * 1024      # ceiling on height * (stride + 1)
+
 
 def _paeth(a: int, b: int, c: int) -> int:
     p = a + b - c
@@ -45,8 +51,13 @@ def read_png_rgb(path: str, max_dim: int = 160) -> Optional[List[List[Tuple[int,
         chunk = data[pos + 8:pos + 8 + length]
         pos += 12 + length  # length + type + data + crc
         if ctype == b"IHDR":
-            width, height, bit_depth, color_type, _, _, interlace = struct.unpack(
-                ">IIBBBBB", chunk)
+            if length != 13:                # malformed IHDR: not a PNG we can trust
+                return None
+            try:
+                width, height, bit_depth, color_type, _, _, interlace = struct.unpack(
+                    ">IIBBBBB", chunk)
+            except struct.error:            # truncated chunk — anything odd returns None
+                return None
         elif ctype == b"IDAT":
             idat.extend(chunk)
         elif ctype == b"IEND":
@@ -56,17 +67,22 @@ def read_png_rgb(path: str, max_dim: int = 160) -> Optional[List[List[Tuple[int,
     channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color_type)
     if channels is None:
         return None
+    stride = width * channels
+    expected = height * (stride + 1)        # exact decoded size of a valid stream
+    if width > _MAX_DIM or height > _MAX_DIM or expected > _MAX_RAW_BYTES:
+        return None
     try:
-        raw = zlib.decompress(bytes(idat))
+        dec = zlib.decompressobj()
+        raw = dec.decompress(bytes(idat), expected)     # bounded: never allocates past cap
     except zlib.error:
         return None
-    stride = width * channels
-    if len(raw) < height * (stride + 1):
+    # more payload than the declared geometry needs (bomb) or less (corrupt) → reject
+    if dec.unconsumed_tail or len(raw) < expected:
         return None
 
     # subsample factor before unfiltering rows we keep — but filters reference the PREVIOUS
     # row, so every row must still be unfiltered in order; we just skip the pixel extraction.
-    step = max(1, max(width, height) // max_dim)
+    step = max(1, max(width, height) // max(1, max_dim))
     rows: List[List[Tuple[int, int, int]]] = []
     prev = bytearray(stride)
     offset = 0

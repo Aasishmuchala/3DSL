@@ -39,16 +39,30 @@ def _resolve_target(target: str):
 
 
 def _coerce(current, value):
-    """Match the incoming JSON value to the property's current MAXScript type."""
+    """Match the incoming JSON value to the property's current MAXScript type. Rejects
+    non-finite floats (a NaN/±inf written into a live light silently poisons renders) and
+    maps bool-ish strings explicitly — ``bool("false") is True`` must never happen."""
     rt = _rt()
     if isinstance(value, (list, tuple)) and len(value) == 3:
+        comps = [float(v) for v in value]
+        if not all(math.isfinite(c) for c in comps):
+            raise ValueError(f"non-finite component in {value!r}")
         try:
             if current is not None and rt.classOf(current) == rt.Point3:
-                return rt.Point3(float(value[0]), float(value[1]), float(value[2]))
+                return rt.Point3(comps[0], comps[1], comps[2])
         except Exception:
             pass
-        return rt.color(float(value[0]), float(value[1]), float(value[2]))
+        return rt.color(comps[0], comps[1], comps[2])
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"non-finite value {value!r}")
     if isinstance(current, bool) or isinstance(value, bool):
+        if isinstance(value, str):
+            low = value.strip().lower()
+            if low in ("true", "1", "yes", "on"):
+                return True
+            if low in ("false", "0", "no", "off"):
+                return False
+            raise ValueError(f"cannot coerce string {value!r} to bool")
         return bool(value)
     if isinstance(current, int) and isinstance(value, (int, float)):
         return int(value)
@@ -143,57 +157,82 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                         report["warnings"].append(
                             f"create {op['light_type']}: class unavailable ({e})")
                         continue
-                    node.name = op["name"]
-                    for k, v in presets.items():
-                        sc.set_prop(node, (k,), v)
-                    if basis is not None or "at_node" in op["placement"]:
-                        try:
-                            node.pos = _place_from(basis or {"pos": [0, 0, 0],
-                                                             "yaw_deg": 0.0,
-                                                             "look": [0, 200, 0]},
-                                                   op["placement"])
-                        except Exception:
-                            report["warnings"].append(f"{op['name']}: placement failed")
-                    if op["light_type"] == "VRaySun" and basis is not None:
-                        # a targetless scripted VRaySun aims straight down — give it a
-                        # target at the camera's subject so its direction is meaningful
-                        try:
-                            tgt = rt.Targetobject()
-                            lx, ly, lz = basis["look"]
-                            tgt.pos = rt.Point3(lx, ly, lz)
-                            tgt.name = op["name"] + "_target"
-                            node.target = tgt
-                        except Exception:
-                            report["warnings"].append(
-                                f"{op['name']}: could not create a sun target")
-                    if op.get("aim_at_camera_target") and basis is not None:
-                        try:
-                            lx, ly, lz = basis["look"]
-                            p = node.pos
-                            d = rt.Point3(lx - float(p.x), ly - float(p.y),
-                                          lz - float(p.z))
-                            node.dir = d
-                        except Exception:
-                            report["warnings"].append(f"{op['name']}: aim failed")
-                    for prop, value in (op.get("props") or {}).items():
-                        try:
-                            setattr(node, prop, _coerce(getattr(node, prop, None), value))
-                        except Exception:
-                            report["warnings"].append(
-                                f"{op['name']}.{prop}: not settable on {op['light_type']}")
-                    layer = _ensure_mg_layer()
-                    if layer is not None:
-                        try:
-                            layer.addNode(node)
-                        except Exception:
-                            pass
-                    where = (op["placement"].get("at_node")
-                             or f"{op['placement'].get('bearing_deg', 0):+.0f}° / "
-                                f"{op['placement'].get('distance', 0):.0f}u / "
-                                f"h{op['placement'].get('height', 0):+.0f}")
-                    report["created"].append({"name": op["name"],
-                                              "type": op["light_type"], "at": where,
-                                              "why": op.get("why", "")})
+                    # the ctor already put a node in the scene — any failure between
+                    # here and the layer-add must delete it, or it leaks off MG_lights
+                    tgt = None
+                    try:
+                        node.name = op["name"]
+                        for k, v in presets.items():
+                            sc.set_prop(node, (k,), v)
+                        if basis is not None or "at_node" in op["placement"]:
+                            try:
+                                node.pos = _place_from(basis or {"pos": [0, 0, 0],
+                                                                 "yaw_deg": 0.0,
+                                                                 "look": [0, 200, 0]},
+                                                       op["placement"])
+                            except Exception:
+                                report["warnings"].append(
+                                    f"{op['name']}: placement failed")
+                        if op["light_type"] == "VRaySun" and basis is not None:
+                            # a targetless scripted VRaySun aims straight down — give it
+                            # a target at the camera's subject so its direction is real
+                            try:
+                                tgt = rt.Targetobject()
+                                lx, ly, lz = basis["look"]
+                                tgt.pos = rt.Point3(lx, ly, lz)
+                                tgt.name = op["name"] + "_target"
+                                node.target = tgt
+                            except Exception:
+                                if tgt is not None:     # don't leak the named helper
+                                    try:
+                                        rt.delete(tgt)
+                                    except Exception:
+                                        pass
+                                    tgt = None
+                                report["warnings"].append(
+                                    f"{op['name']}: could not create a sun target")
+                        if op.get("aim_at_camera_target") and basis is not None:
+                            try:
+                                lx, ly, lz = basis["look"]
+                                p = node.pos
+                                d = rt.Point3(lx - float(p.x), ly - float(p.y),
+                                              lz - float(p.z))
+                                node.dir = d
+                            except Exception:
+                                report["warnings"].append(f"{op['name']}: aim failed")
+                        for prop, value in (op.get("props") or {}).items():
+                            try:
+                                setattr(node, prop,
+                                        _coerce(getattr(node, prop, None), value))
+                            except Exception:
+                                report["warnings"].append(
+                                    f"{op['name']}.{prop}: not settable on "
+                                    f"{op['light_type']}")
+                        layer = _ensure_mg_layer()
+                        if layer is not None:
+                            for n in (node, tgt):       # sun target lives on-layer too
+                                if n is None:
+                                    continue
+                                try:
+                                    layer.addNode(n)
+                                except Exception:
+                                    pass
+                        where = (op["placement"].get("at_node")
+                                 or f"{op['placement'].get('bearing_deg', 0):+.0f}° / "
+                                    f"{op['placement'].get('distance', 0):.0f}u / "
+                                    f"h{op['placement'].get('height', 0):+.0f}")
+                        report["created"].append({"name": op["name"],
+                                                  "type": op["light_type"], "at": where,
+                                                  "why": op.get("why", "")})
+                    except Exception as e:  # noqa: BLE001 — roll back the orphan node
+                        for n in (node, tgt):
+                            try:
+                                if n is not None:
+                                    rt.delete(n)
+                            except Exception:
+                                pass
+                        report["warnings"].append(
+                            f"create {op.get('name', '?')}: failed — node removed ({e})")
             except Exception as e:  # noqa: BLE001 one op must never kill the plan
                 report["warnings"].append(f"op failed: {e}")
     try:

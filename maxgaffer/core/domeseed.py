@@ -32,6 +32,7 @@ output goes through hdr_min. Everything is deterministic.
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import hdr_min, metrics
@@ -128,6 +129,24 @@ def synthesize_pano(
     return rows
 
 
+def _reorient(get, w: int, h: int, cam_yaw_deg: float,
+              out_w: int, out_h: int) -> Rows:
+    """Shared resample+rotate: source u=0.5 = camera-forward → column azimuth 0 = north.
+    ``get(i)`` returns the i-th source pixel (row-major) as LINEAR floats."""
+    rows: Rows = []
+    for y in range(out_h):
+        v = (y + 0.5) / out_h
+        iy = min(h - 1, int(v * h))
+        row: List[Tuple[float, float, float]] = []
+        for x in range(out_w):
+            az = (x + 0.5) * 360.0 / out_w
+            u = (0.5 + _wrap180(az - cam_yaw_deg) / 360.0) % 1.0
+            ix = min(w - 1, int(u * w))
+            row.append(get(iy * w + ix))
+        rows.append(row)
+    return rows
+
+
 def ingest_pano(
     pixels: Sequence[Tuple[int, int, int]],
     w: int,
@@ -138,19 +157,27 @@ def ingest_pano(
 ) -> Rows:
     """An EXTERNAL equirect pano (camera-forward at u=0.5, e.g. DiffusionLight output) →
     world-oriented linear rows: resample + rotate so column azimuth 0 lands at north."""
-    rows: Rows = []
-    for y in range(out_h):
-        v = (y + 0.5) / out_h
-        iy = min(h - 1, int(v * h))
-        row: List[Tuple[float, float, float]] = []
-        for x in range(out_w):
-            az = (x + 0.5) * 360.0 / out_w
-            u = (0.5 + _wrap180(az - cam_yaw_deg) / 360.0) % 1.0
-            ix = min(w - 1, int(u * w))
-            p = pixels[iy * w + ix]
-            row.append((_SRGB_LUT[p[0]], _SRGB_LUT[p[1]], _SRGB_LUT[p[2]]))
-        rows.append(row)
-    return rows
+    return _reorient(
+        lambda i: (_SRGB_LUT[pixels[i][0]], _SRGB_LUT[pixels[i][1]],
+                   _SRGB_LUT[pixels[i][2]]),
+        w, h, cam_yaw_deg, out_w, out_h)
+
+
+def ingest_pano_hdr(
+    hdr_rows: Rows,
+    cam_yaw_deg: float,
+    out_w: int = 256,
+    out_h: int = 128,
+) -> Rows:
+    """A Radiance .hdr equirect (hdr_min.read_hdr rows, already LINEAR) → world-oriented
+    linear rows. HDR stays HDR — a generative pano's own energy (sun, windows) survives
+    ingest instead of being crushed to 8-bit like the LDR path."""
+    h = len(hdr_rows)
+    w = len(hdr_rows[0]) if h else 0
+    if not w:
+        return []
+    flat = [p for r in hdr_rows for p in r]
+    return _reorient(lambda i: flat[i], w, h, cam_yaw_deg, out_w, out_h)
 
 
 # --------------------------------------------------------------------------- filtering
@@ -270,6 +297,12 @@ def lift_sky(rows: Rows, above_alt_deg: float = 10.0, factor: float = 1.3) -> No
 
 
 # --------------------------------------------------------------------------- entry point
+class SeedError(RuntimeError):
+    """build_seed failure that names the failing STAGE — raised where returning None
+    would misreport the cause (a .hdr WRITE failure is not an unreadable reference, and
+    an unsupported pano format is not a corrupt one)."""
+
+
 def build_seed(
     out_path: str,
     ref_path: Optional[str] = None,
@@ -285,7 +318,10 @@ def build_seed(
     sun_size_deg: float = 4.0,
     ambient_key: float = 0.35,
 ) -> Optional[Dict]:
-    """Reference (or external pano) → seeded .hdr on disk. → meta dict, None on failure.
+    """Reference (or external pano) → seeded .hdr on disk. → meta dict, None when the
+    source can't be read. Raises SeedError when the source read FINE but the seed can't
+    be written (read-only dir, full disk, over-long path) or the pano format is
+    unsupported — None would misreport those as an unreadable reference.
 
     Sun placement: explicit (az, alt) wins (pass the solved/matched values); otherwise it
     derives from semantics (camera yaw + bearing, altitude band table) exactly like the
@@ -294,16 +330,27 @@ def build_seed(
     src = pano_path or ref_path
     if not src:
         return None
-    loaded = metrics._load_pixels(src, max_dim=384)
-    if not loaded:
-        return None
-    pixels, w, h = loaded
-    if pano_path:
-        rows = ingest_pano(pixels, w, h, cam_yaw_deg, out_w, out_h)
-        source = "pano"
-    else:
-        rows = synthesize_pano(pixels, w, h, cam_yaw_deg, out_w, out_h, fov_deg)
-        source = "reference"
+    rows: Optional[Rows] = None
+    source = "pano" if pano_path else "reference"
+    ext = os.path.splitext(src)[1].lower()
+    if pano_path and ext == ".exr":
+        raise SeedError(
+            f"pano '{src}' is OpenEXR — the seed seam ingests Radiance .hdr (or LDR "
+            "PNG/JPEG); convert the .exr first (SPEC §10)")
+    if pano_path and ext == ".hdr":
+        hdr_rows = hdr_min.read_hdr(src)     # SPEC §10's DiffusionLight-class gate
+        if hdr_rows:
+            rows = ingest_pano_hdr(hdr_rows, cam_yaw_deg, out_w, out_h)
+        # exotic .hdr variants read_hdr declines fall through to the LDR loader
+    if rows is None:
+        loaded = metrics._load_pixels(src, max_dim=384)
+        if not loaded:
+            return None
+        pixels, w, h = loaded
+        if pano_path:
+            rows = ingest_pano(pixels, w, h, cam_yaw_deg, out_w, out_h)
+        else:
+            rows = synthesize_pano(pixels, w, h, cam_yaw_deg, out_w, out_h, fov_deg)
     rows = blur_pano(rows)
     rows, scale = normalize_key(rows, ambient_key)
 
@@ -328,7 +375,9 @@ def build_seed(
         lift_sky(rows)
 
     if not hdr_min.write_hdr(out_path, rows):
-        return None
+        raise SeedError(
+            f"could not WRITE the seed .hdr to '{out_path}' — the source read fine; "
+            "check the run dir (read-only, disk full, or over-long path)")
     return {
         "path": out_path,
         "source": source,

@@ -22,6 +22,14 @@ def _rt():
     return pymxs.runtime
 
 
+def _warn(msg: str) -> None:
+    """Bridge defects must be LOUD (Max listener) but never fatal."""
+    try:
+        print("[MaxGaffer] scene: " + msg)
+    except Exception:
+        pass
+
+
 # ------------------------------------------------------------------ candidates plumbing
 def get_prop(obj, names: Tuple[str, ...], default=None):
     rt = _rt()
@@ -65,16 +73,32 @@ def _class_name(obj) -> str:
         return ""
 
 
+def _node_name(obj) -> str:
+    try:
+        return str(obj.name)
+    except Exception:
+        return "<unreadable>"
+
+
 def camera_yaw_deg(cam) -> float:
     """World compass bearing of the camera's look direction (0 = +Y, clockwise)."""
     try:
         row3 = cam.transform.row3            # local Z axis in world space
         dx, dy = -float(row3.x), -float(row3.y)   # look = -Z
-        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
-            return 0.0
-        return math.degrees(math.atan2(dx, dy)) % 360.0
-    except Exception:
+    except (AttributeError, RuntimeError) as e:
+        # stale node handle / deleted camera — NOT the same as a zero-length axis
+        _warn(f"camera_yaw_deg: transform unreadable ({e}) — yaw guesses will use 0°")
         return 0.0
+    except (TypeError, ValueError) as e:
+        # transform read fine but the math rejected it (corrupt TM values)
+        _warn(f"camera_yaw_deg: bad transform values ({e}) — yaw guesses will use 0°")
+        return 0.0
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return 0.0
+    return math.degrees(math.atan2(dx, dy)) % 360.0
+
+
+_DUPE_WARNED: set = set()          # duplicate names already shouted about this session
 
 
 def list_cameras() -> List[Dict[str, Any]]:
@@ -92,12 +116,43 @@ def list_cameras() -> List[Dict[str, Any]]:
                 continue
     except Exception:
         pass
+    # Max permits duplicate node names (merged scenes); get_camera resolves the FIRST in
+    # collection order, so flag every entry whose name is not unique.
+    counts: Dict[str, int] = {}
+    for c in out:
+        counts[c["name"]] = counts.get(c["name"], 0) + 1
+    for c in out:
+        if counts[c["name"]] > 1:
+            c["duplicate"] = True
+            if c["name"] not in _DUPE_WARNED:
+                _DUPE_WARNED.add(c["name"])
+                _warn(f"{counts[c['name']]} cameras named '{c['name']}' — "
+                      "MaxGaffer always uses the first in scene order")
     return out
 
 
 def get_camera(name: str):
+    """Resolve a camera by name. With duplicate names, getNodeByName's pick is
+    unspecified — walk the same collection list_cameras() shows and take the FIRST match,
+    so the node acted on is always the first one the board lists."""
     try:
-        return _rt().getNodeByName(name, exact=True)
+        rt = _rt()
+    except Exception:
+        return None
+    try:
+        for o in rt.cameras:
+            cname = _class_name(o)
+            if "target" in cname.lower() and "camera" not in cname.lower():
+                continue
+            try:
+                if str(o.name) == name:
+                    return o
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        return rt.getNodeByName(name, exact=True)   # legacy fallback (non-camera nodes)
     except Exception:
         return None
 
@@ -161,6 +216,15 @@ def classify_rig() -> Dict[str, Any]:
             if rig["sun"] is None:
                 rig["sun"] = lt
                 try:
+                    tgt = getattr(lt, "target", None)
+                    # a deleted target reads back as a dead-node wrapper, not None
+                    if tgt is None or not rt.isValidNode(tgt):
+                        rig["notes"].append(
+                            f"sun '{lt.name}' has no target — an untargeted VRaySun aims "
+                            "by node rotation, so azimuth/altitude writes will not re-aim it")
+                except Exception:
+                    pass
+                try:
                     ctrl = str(rt.classOf(lt.transform.controller)).lower()
                     if "position" not in ctrl and "prs" not in ctrl:
                         rig["notes"].append(
@@ -169,13 +233,13 @@ def classify_rig() -> Dict[str, Any]:
                 except Exception:
                     pass
             else:
-                rig["notes"].append(f"extra VRaySun '{lt.name}' ignored (first one wins)")
+                rig["notes"].append(f"extra VRaySun '{_node_name(lt)}' ignored (first one wins)")
         elif cname == "vraylight":
             # dome detection: V-Ray light .type — dome is expected to be 1 (VERIFY ON BOX)
             if _dome_type_value(lt) == 1 and rig["dome"] is None:
                 rig["dome"] = lt
             elif _dome_type_value(lt) == 1:
-                rig["notes"].append(f"extra dome '{lt.name}' ignored")
+                rig["notes"].append(f"extra dome '{_node_name(lt)}' ignored")
             else:
                 _add_group_light(rig, lt)
         elif cname in ("vrayies", "vrayambientlight"):
@@ -219,13 +283,27 @@ def _sun_pivot(sun):
     return rt.Point3(0.0, 0.0, 0.0)
 
 
+def sun_readable(sun) -> bool:
+    """False when the sun handle is stale (deleted mid-session while the rig is cached).
+    Callers should skip sun math rather than act on placeholder angles."""
+    try:
+        sun.pos
+        return True
+    except Exception:
+        return False
+
+
 def read_sun_angles(sun) -> Tuple[float, float, float]:
     """→ (azimuth_deg, altitude_deg, distance). Direction FROM pivot TO sun position."""
     pivot = _sun_pivot(sun)
     try:
         d = sun.pos - pivot
         dx, dy, dz = float(d.x), float(d.y), float(d.z)
-    except Exception:
+    except Exception as e:
+        # LOUD placeholder: callers keep their tuple contract, but this must never be
+        # mistaken for real geometry (write_sun_angles refuses to act on it)
+        _warn(f"read_sun_angles: sun position unreadable ({e}) — returning placeholder "
+              "angles; do not trust them")
         return 0.0, 45.0, 10000.0
     dist = math.sqrt(dx * dx + dy * dy + dz * dz) or 10000.0
     horiz = math.sqrt(dx * dx + dy * dy)
@@ -236,6 +314,11 @@ def read_sun_angles(sun) -> Tuple[float, float, float]:
 
 def write_sun_angles(sun, azimuth_deg: float, altitude_deg: float) -> bool:
     rt = _rt()
+    if not sun_readable(sun):
+        # a stale handle would silently orbit the WORLD ORIGIN at 10000 units off the
+        # read_sun_angles placeholder — refuse to mutate instead
+        _warn("write_sun_angles: sun unreadable (stale handle?) — sun NOT moved")
+        return False
     pivot = _sun_pivot(sun)
     _, _, dist = read_sun_angles(sun)
     az, alt = math.radians(azimuth_deg), math.radians(altitude_deg)
@@ -305,9 +388,12 @@ def get_dome_texture(dome) -> str:
 
 def set_dome_texture(dome, hdri_path: str) -> str:
     """Point the dome light at an HDRI file, creating a VRayBitmap texmap if the dome has
-    none. Returns how it was done ('failed' = nothing writable found)."""
+    none. Returns how it was done ('failed' = nothing writable found — and NOTHING was
+    changed: a fresh texmap gets its file set FIRST and is only bound on success, so a
+    failure never leaves an empty texmap blacking out the dome)."""
     rt = _rt()
     tex = get_prop(dome, ("texmap",))
+    created = False
     if tex is None:
         for maker in ("VRayBitmap", "VRayHDRI"):
             try:
@@ -317,12 +403,14 @@ def set_dome_texture(dome, hdri_path: str) -> str:
                 tex = None
         if tex is None:
             return "failed"
+        created = True
+    used = set_prop(tex, DOME_TEX_FILE, hdri_path)
+    if used is None:
+        return "failed"                     # created texmap was never bound — clean
+    if created:
         try:
             dome.texmap = tex
         except Exception:
-            return "failed"
-    used = set_prop(tex, DOME_TEX_FILE, hdri_path)
-    if used is None:
-        return "failed"
+            return "failed"                 # dome.texmap untouched — still clean
     set_prop(dome, DOME_TEX_ON, True)   # best-effort; missing prop is fine
     return f"texmap.{used}"

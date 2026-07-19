@@ -7,6 +7,7 @@ then degrade gracefully instead of applying garbage to a client scene.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Sequence
 
 from .omega import parse_json_from_text
@@ -23,9 +24,12 @@ class ParseError(ValueError):
 
 def _num(d: Dict, key: str, lo: float, hi: float, default: float) -> float:
     try:
-        return min(hi, max(lo, float(d.get(key))))
+        v = float(d.get(key))
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(v):                # bare NaN/Infinity parse via json defaults
+        return default
+    return min(hi, max(lo, v))
 
 
 def _enum(d: Dict, key: str, allowed: Sequence[str], default: str) -> str:
@@ -78,6 +82,8 @@ def validate_deltas(reply_text: str, max_changes: int = 4) -> Dict:
             try:
                 value = float(item.get("value"))
             except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):    # NaN/±inf must never reach the genome
                 continue
             if isinstance(param, str) and param:
                 changes[param] = value

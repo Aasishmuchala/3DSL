@@ -33,8 +33,8 @@ critic compares only what transfers between *different* scenes — tonal envelop
 mood, and (since v0.6) a mean-centered 3×3 luminance grid: WHERE the light lives — never
 SSIM. The loop shows the model its own parameter trajectory to damp oscillation, and every
 executed plan is probe-rendered before/after with the critic's verdict in the popup.
-Measured on the live hidden-target benchmark: Phase B 14.7 → **90.0 (target_reached)**
-vs the pre-v0.6 baseline of 85.1 best / 56.6 stalled.
+Measured on the live hidden-target benchmark: Phase B 14.3 → **98.25 (4° sun-direction
+error)** vs the pre-v0.6 baseline of 85.1 best / 56.6 stalled (dated 2026-07-16 run).
 
 ## Architecture (hexagon, enforced)
 
@@ -270,7 +270,7 @@ MaxDirector's SPEC deferred to its P2.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install pytest pillow
-.venv/bin/python -m pytest tests/ -q          # ~70 tests, all pure core
+.venv/bin/python -m pytest tests/ -q          # 3154 tests, all pure core
 ```
 
 The suite catches the classics: EV/WB sign conventions, the 180°-wrap ambiguity, LLM junk

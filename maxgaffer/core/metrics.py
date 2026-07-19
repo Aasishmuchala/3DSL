@@ -37,7 +37,10 @@ def _load_pixels(path: str, max_dim: int = 256):
         pass
     from . import png_min
 
-    rows = png_min.read_png_rgb(path, max_dim=max_dim)
+    try:
+        rows = png_min.read_png_rgb(path, max_dim=max_dim)
+    except Exception:                         # the stdlib floor degrades, never raises
+        return None                           # (SPEC: loop stats can never fail)
     if rows is None or not rows[0]:
         return None
     return [px for row in rows for px in row], len(rows[0]), len(rows)

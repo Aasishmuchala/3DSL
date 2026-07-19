@@ -33,6 +33,8 @@ def float_to_rgbe(r: float, g: float, b: float) -> Tuple[int, int, int, int]:
     if m < 1e-9:
         return 0, 0, 0, 0
     _mant, exp = math.frexp(m)              # m = mant * 2**exp, mant in [0.5, 1)
+    if exp + 128 > 255:                     # finite but beyond RGBE range: saturate to the
+        return 255, 255, 255, 255           # hottest representable pixel (keeps bytes valid)
     scale = math.ldexp(1.0, 8 - exp)        # component * scale lands in [0, 256)
     return (
         min(255, max(0, int(r * scale))),
@@ -106,7 +108,7 @@ def write_hdr(path: str, rows: Sequence[Sequence[Tuple[float, float, float]]]) -
                 else:
                     f.write(bytes(b for p in px for b in p))
         return True
-    except OSError:
+    except (OSError, ValueError):           # documented contract: False, never raise
         return False
 
 
@@ -183,6 +185,16 @@ def read_hdr(path: str) -> Optional[List[List[Tuple[float, float, float]]]]:
     if head is None:
         return None
     width, height, pos = head
+    # Old-style RLE honesty: scanlines in the 8..32767 band without the 2,2,w>>8,w marker
+    # are only decodable as flat data when the payload is EXACTLY flat-sized — anything
+    # else is old-style RLE, which we refuse (None) rather than silently misdecode.
+    if (
+        _MIN_RLE_WIDTH <= width <= _MAX_RLE_WIDTH
+        and not (pos + 4 <= len(data) and data[pos] == 2 and data[pos + 1] == 2
+                 and ((data[pos + 2] << 8) | data[pos + 3]) == width)
+        and len(data) - pos != height * width * 4
+    ):
+        return None
     rows: List[List[Tuple[float, float, float]]] = []
     for _y in range(height):
         is_rle = (

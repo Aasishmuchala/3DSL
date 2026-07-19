@@ -9,14 +9,30 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from typing import Dict
+from typing import Any, Dict, Tuple
+
+
+def _warn(msg: str) -> None:
+    """Config problems must be LOUD (Max listener / console) but never fatal."""
+    try:
+        print("[MaxGaffer] config: " + msg)
+    except Exception:
+        pass
 
 
 def _appdata_dir(name: str) -> str:
+    """Path only — directory creation is deferred to first use. Importing this module
+    must never touch the disk (an unwritable profile, or a FILE named 'MaxGaffer' in
+    %LOCALAPPDATA%, would otherwise kill the whole plugin load at import time)."""
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, name)
-    os.makedirs(d, exist_ok=True)
-    return d
+    return os.path.join(base, name)
+
+
+def _ensure_dir(d: str) -> None:
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        _warn(f"could not create {d} ({e})")
 
 
 CONFIG_PATH = os.path.join(_appdata_dir("MaxGaffer"), "config.json")
@@ -55,18 +71,54 @@ class Config:
     repo_path: str = ""                      # clone folder, written by install.bat
 
     def save(self) -> None:
+        _ensure_dir(os.path.dirname(CONFIG_PATH))
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(asdict(self), f, indent=1)
 
 
+def _type_ok(value: Any, default: Any) -> Tuple[bool, Any]:
+    """Check a loaded JSON value against the dataclass default's type. Returns
+    (accepted, coerced-value). bool is NOT an int here; an int IS accepted for a float
+    field (JSON has one number type) and widened."""
+    t = type(default)
+    if t is bool:
+        return type(value) is bool, value
+    if t is int:
+        return type(value) is int, value
+    if t is float:
+        ok = type(value) in (int, float)
+        return ok, float(value) if ok else default
+    if t is str:
+        return isinstance(value, str), value
+    if t is dict:
+        return isinstance(value, dict), value
+    return isinstance(value, t), value
+
+
 def load() -> Config:
     cfg = Config()
+    defaults = Config()
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             d = json.load(f)
-        for k, v in d.items():
-            if hasattr(cfg, k):
-                setattr(cfg, k, v)
+        if not isinstance(d, dict):
+            # valid JSON but not an object (null, [], "str", 42 — hand-edit, crashed sync
+            # tool, version downgrade): d.items() would raise AttributeError, which the
+            # except below deliberately does NOT cover. Treat as empty, loudly.
+            _warn(f"{CONFIG_PATH} holds {type(d).__name__}, not an object — "
+                  "ignoring it, using defaults")
+        else:
+            for k, v in d.items():
+                if hasattr(cfg, k):
+                    ok, vv = _type_ok(v, getattr(defaults, k))
+                    if ok:
+                        setattr(cfg, k, vv)
+                    else:
+                        # wrong-typed values surface as TypeErrors three modules away
+                        # (dock slots, critic weights) — reject them AT THE SOURCE
+                        _warn(f"'{k}' is {type(v).__name__}, expected "
+                              f"{type(getattr(defaults, k)).__name__} — keeping default "
+                              f"{getattr(defaults, k)!r}")
     except (OSError, ValueError):
         pass
     if not cfg.api_key:
@@ -78,12 +130,16 @@ def _borrow_maxdirector_key() -> str:
     try:
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
         with open(os.path.join(base, "MaxDirector", "config.json"), encoding="utf-8") as f:
-            return str(json.load(f).get("api_key") or "")
+            d = json.load(f)
+        if isinstance(d, dict):
+            return str(d.get("api_key") or "")
+        _warn("MaxDirector config.json is not an object — no key borrowed")
     except (OSError, ValueError):
-        return ""
+        pass
+    return ""
 
 
 def sessions_dir() -> str:
     d = os.path.join(_appdata_dir("MaxGaffer"), "sessions")
-    os.makedirs(d, exist_ok=True)
+    _ensure_dir(d)
     return d

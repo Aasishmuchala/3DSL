@@ -8,9 +8,12 @@ iterate with the real solver, critic, guards and live DELTAS calls.
 
     python scripts/sim_match.py [oc_key]      (falls back to scripted-LLM if offline)
 
-PASS criteria (deterministic legs, asserted):  EV within 0.75 stop of target · WB within
-800 K · critic score improves ≥ 15 points. LLM legs (azimuth direction, altitude) are
+PASS criteria (deterministic legs, asserted):  EV within 0.5 stop of target · WB within
+700 K · critic score improves ≥ 15 points. LLM legs (azimuth direction, altitude) are
 reported, not asserted — taste is bounded, not deterministic.
+
+REQUIRES Pillow (pip install pillow) for the synthetic-world renderer — a proof-script
+dependency only; the shipping engine keeps the SPEC §2 stdlib floor (stdlib PNG stats).
 """
 
 from __future__ import annotations
@@ -55,7 +58,13 @@ class World:
         self.n = 0
 
     def render(self, st: LightingState, tag: str) -> str:
-        from PIL import Image, ImageDraw
+        try:
+            from PIL import Image, ImageDraw
+        except ImportError as e:   # loud + friendly, not a raw ImportError (see docstring)
+            raise SystemExit(
+                "sim_match.py needs Pillow for its synthetic world — run "
+                "`pip install pillow`. (Proof-script-only dependency; maxgaffer/core "
+                "keeps the SPEC §2 stdlib floor.)") from e
 
         ev = st.get("exposure.ev", 11.5)
         wb = st.get("exposure.wb_kelvin", 6500.0)
@@ -124,6 +133,33 @@ class ScriptedLLM:
     def sweep(self, n):
         return json.dumps({"best_index": min(2, n - 1), "altitude_hint": "golden",
                            "why": "scripted"})
+
+
+def analyze_semantics(key: str, live: bool, scripted: "ScriptedLLM", ref_path: str,
+                      log=print) -> dict:
+    """3-sample ANALYZE consensus. The LLM leg must NEVER kill the script: gateway errors
+    (OmegaError) and junk replies (ParseError) only skip their sample, and when nothing
+    survives, the scripted offline semantics stand in — the script's own "falls back if
+    offline" contract, honored mid-run too (consolidate_analyses([]) raises ValueError)."""
+    from maxgaffer.core.consensus import consolidate_analyses
+
+    samples = []
+    for _ in range(3 if live else 1):
+        try:
+            reply = (omega.call(key, prompts.ANALYZE_SYSTEM,
+                                [{"role": "user", "content": [
+                                    omega.image_block_from_file(ref_path),
+                                    omega.text_block(prompts.analyze_user_text())]}],
+                                max_tokens=2048) if live else scripted.analyze())
+            samples.append(parse.validate_analysis(reply))
+        except omega.OmegaError as e:
+            log(f"   · ANALYZE sample failed — gateway: {e}")
+        except parse.ParseError as e:
+            log(f"   · ANALYZE sample unparsable — {e}")
+    if not samples:
+        log("   · all ANALYZE samples failed — scripted semantics (offline contract)")
+        samples = [parse.validate_analysis(scripted.analyze())]
+    return consolidate_analyses(samples)
 
 
 def phase_a_solver_only(world, ref_path, ref_stats) -> bool:
@@ -215,22 +251,9 @@ def main() -> int:
         return omega.image_block_from_file(path)
 
     # ---------- ① ANALYZE (3-sample self-consistency, as the controller now runs it)
-    from maxgaffer.core.consensus import consolidate_analyses
-
-    samples = []
-    for _ in range(3 if live else 1):
-        reply = (omega.call(key, prompts.ANALYZE_SYSTEM,
-                            [{"role": "user", "content": [
-                                img(ref_path),
-                                omega.text_block(prompts.analyze_user_text())]}],
-                            max_tokens=2048) if live else scripted.analyze())
-        try:
-            samples.append(parse.validate_analysis(reply))
-        except parse.ParseError:
-            continue
-    semantics = consolidate_analyses(samples)
+    semantics = analyze_semantics(key, live, scripted, ref_path)
     agreement = semantics.pop("consensus_agreement", 1.0)
-    print(f"\n① analyze ×{len(samples)} (agreement {agreement:.0%}): "
+    print(f"\n① analyze (agreement {agreement:.0%}): "
           f"{semantics['time_of_day']}, bearing {semantics['sun_bearing_deg']:+.0f}°, "
           f"band {semantics['sun_altitude_band']}, "
           f"wb~{semantics['wb_kelvin_estimate']:.0f}K")
@@ -246,19 +269,30 @@ def main() -> int:
         logs.append(m)
         print("   ·", m)
 
+    def deltas_reply(ctx):
+        """Live DELTAS with the offline contract: a gateway failure costs one scripted
+        no-op iteration, never the whole Phase B run."""
+        if not live:
+            return scripted.deltas(ctx)
+        try:
+            return omega.call(
+                key, prompts.DELTAS_SYSTEM,
+                [{"role": "user", "content": [
+                    img(ref_path), img(ctx["render_path"]),
+                    omega.text_block(prompts.deltas_user_text(
+                        ctx["state_table"], ctx["semantics"], ctx["score_history"],
+                        ctx["analytic_applied"], ctx["iteration"], ctx["max_iterations"]))]}],
+                max_tokens=2048)
+        except omega.OmegaError as e:
+            log(f"DELTAS call failed ({e}) — scripted no-op this iteration")
+            return scripted.deltas(ctx)
+
     current = {"st": start.copy()}
     hooks = Hooks(
         apply=lambda st: current.__setitem__("st", st.copy()),
         render=lambda tag: world.render(current["st"], tag),
         stats=metrics.compute_stats,
-        llm_deltas=lambda ctx: (omega.call(
-            key, prompts.DELTAS_SYSTEM,
-            [{"role": "user", "content": [
-                img(ref_path), img(ctx["render_path"]),
-                omega.text_block(prompts.deltas_user_text(
-                    ctx["state_table"], ctx["semantics"], ctx["score_history"],
-                    ctx["analytic_applied"], ctx["iteration"], ctx["max_iterations"]))]}],
-            max_tokens=2048) if live else scripted.deltas(ctx)),
+        llm_deltas=deltas_reply,
         log=log,
     )
 
@@ -266,10 +300,14 @@ def main() -> int:
     def sweep_pick(paths, azs):
         if not live:
             return scripted.sweep(len(paths))
-        content = [img(ref_path)] + [img(p) for p in paths]
-        content.append(omega.text_block(prompts.sweep_user_text(azs)))
-        return omega.call(key, prompts.SWEEP_SYSTEM,
-                          [{"role": "user", "content": content}], max_tokens=1024)
+        try:
+            content = [img(ref_path)] + [img(p) for p in paths]
+            content.append(omega.text_block(prompts.sweep_user_text(azs)))
+            return omega.call(key, prompts.SWEEP_SYSTEM,
+                              [{"role": "user", "content": content}], max_tokens=1024)
+        except omega.OmegaError as e:
+            log(f"SWEEP call failed ({e}) — scripted pick")
+            return scripted.sweep(len(paths))
 
     az, hint, _why = run_sun_sweep(start, [0.0, 90.0, 180.0, 270.0], hooks, sweep_pick,
                                    ref_stats=ref_stats)

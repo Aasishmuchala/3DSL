@@ -2,7 +2,8 @@
 
 Off-Max it checks: core imports, the full test-suite floor (stdlib PNG stats), Pillow,
 gateway reachability. Inside Max's listener it additionally checks pymxs, V-Ray, the
-vrscene exporter, vantage_console.exe, and classifies the open scene's rig.
+vrscene exporter, vantage.exe (vantage_console.exe only when the legacy "vantage_cli"
+backend is configured — stock Vantage 3.x has no render CLI), and classifies the rig.
 """
 
 from __future__ import annotations
@@ -80,7 +81,8 @@ def main():
             from pymxs import runtime as rt
 
             r = str(rt.classOf(rt.renderers.current))
-            if "vray" not in r.lower():
+            # class names carry underscores on some builds: V_Ray_GPU_7__update_2_hotfix_2
+            if "vray" not in r.lower().replace("_", ""):
                 raise RuntimeError(f"current renderer is {r} — set V-Ray")
             return r
 
@@ -98,12 +100,32 @@ def main():
         def _vantage():
             from maxgaffer.maxbridge import config as cfgmod
 
-            p = cfgmod.load().vantage_console
+            p = cfgmod.load().vantage_exe
             if not os.path.exists(p):
-                raise RuntimeError(f"not found: {p}")
+                raise RuntimeError(f"not found: {p} — set config.vantage_exe; the live "
+                                   "link can still start Vantage via V-Ray's toolbar action")
             return p
 
-        check("vantage_console.exe", _vantage)
+        check("vantage.exe (handoff)", _vantage)
+
+        # stock Vantage 3.x REMOVED its render CLI (SPEC §2) — the console is only
+        # required on the legacy opt-in backend, same rule as onbox_spikes.py M/M2
+        def _vantage_console():
+            from maxgaffer.maxbridge import config as cfgmod
+
+            p = cfgmod.load().vantage_console
+            if not os.path.exists(p):
+                raise RuntimeError(f"not found: {p} — backend 'vantage_cli' needs the "
+                                   "Developer Edition console exe")
+            return p
+
+        from maxgaffer.maxbridge import config as cfgmod
+
+        if cfgmod.load().final_render_backend == "vantage_cli":
+            check("vantage_console.exe (Developer Edition CLI)", _vantage_console)
+        else:
+            print(f"  [--] vantage_console.exe not required — final_render_backend "
+                  f"{cfgmod.load().final_render_backend!r} (stock Vantage 3.x has no CLI)")
 
         def _rig():
             from maxgaffer.maxbridge import scene

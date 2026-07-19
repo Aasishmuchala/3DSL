@@ -11,11 +11,15 @@ Timestamps are injected so tests stay deterministic.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set
 
 from .genome import LightingState
+
+log = logging.getLogger(__name__)
 
 FORMAT_VERSION = 1
 
@@ -85,18 +89,35 @@ class Session:
         # anim handles do not.
         self.baselines: Dict[str, float] = {}
         self._now = now_fn or _iso_now
+        # Set when the on-disk sidecar failed to load (or is a newer format): auto-save
+        # must NOT overwrite the file until the user saves explicitly (save(force=True)).
+        self._protect_existing = False
 
     def adopt_baselines(self, fresh: Dict[str, float]) -> List[str]:
         """Adopt baselines for lights we have never seen; NEVER overwrite known ones.
+        A 0.0 (or non-finite) multiplier is declined: it is almost always a dimmed light,
+        not an authored value, and adopting it kills the group forever (0 × any factor).
         Returns the names actually adopted."""
         added: List[str] = []
         for name, value in (fresh or {}).items():
-            if name not in self.baselines:
-                try:
-                    self.baselines[str(name)] = float(value)
-                    added.append(str(name))
-                except (TypeError, ValueError):
-                    continue
+            if name in self.baselines:
+                continue
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(v):
+                log.warning("MaxGaffer: refusing non-finite baseline for light %r: %r",
+                            name, value)
+                continue
+            if v == 0.0:
+                log.warning("MaxGaffer: declining to adopt 0.0 baseline for light %r — "
+                            "likely dimmed, not authored (0.0 × any factor stays 0 "
+                            "forever); re-author the light, or forget_baseline + re-scan "
+                            "to force re-capture", name)
+                continue
+            self.baselines[str(name)] = v
+            added.append(str(name))
         return added
 
     def forget_baseline(self, name: str) -> None:
@@ -112,19 +133,60 @@ class Session:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            s._quarantine_corrupt(f"unreadable sidecar ({e})")
             return s
-        for name, entry in (d.get("cameras") or {}).items():
-            if isinstance(entry, dict):
-                s.cameras[str(name)] = CameraEntry.from_dict(entry)
+        if not isinstance(d, dict):
+            # valid JSON, wrong shape (hand-edit / another tool) — same data-loss guard
+            s._quarantine_corrupt(f"sidecar top level is {type(d).__name__}, not an object")
+            return s
+        version = d.get("version")
+        if isinstance(version, (int, float)) and version > FORMAT_VERSION:
+            log.warning("MaxGaffer: sidecar %s is format v%s, NEWER than this build's "
+                        "v%d — loading best-effort and blocking auto-save so the newer "
+                        "file is not silently downgraded; save explicitly to force",
+                        path, version, FORMAT_VERSION)
+            s._protect_existing = True
+        cameras = d.get("cameras")
+        if isinstance(cameras, dict):
+            for name, entry in cameras.items():
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    s.cameras[str(name)] = CameraEntry.from_dict(entry)
+                except Exception as e:  # one corrupt camera must not kill the rest
+                    log.warning("MaxGaffer: skipping corrupt camera entry %r in %s: %s",
+                                name, path, e)
         if isinstance(d.get("settings"), dict):
             s.settings.update(d["settings"])
         if isinstance(d.get("baselines"), dict):
             s.adopt_baselines(d["baselines"])
         return s
 
-    def save(self) -> bool:
+    def _quarantine_corrupt(self, reason: str) -> None:
+        """Move the unreadable sidecar to a timestamped .corrupt backup, log loudly, and
+        block auto-save — the file may still be human-recoverable, and the old behavior
+        (empty session silently saved over it) destroyed it on the next rig scan."""
+        self._protect_existing = True
+        stamp = "".join(c if c.isalnum() else "" for c in self._now())
+        backup = f"{self.path}.{stamp}.{os.getpid()}.corrupt"
+        try:
+            os.replace(self.path, backup)
+            log.warning("MaxGaffer: %s — moved %s → %s and started an EMPTY session; "
+                        "auto-save is blocked until you save explicitly",
+                        reason, self.path, backup)
+        except OSError as e:
+            log.warning("MaxGaffer: %s — could not move %s aside (%s); started an EMPTY "
+                        "session, auto-save is blocked until you save explicitly",
+                        reason, self.path, e)
+
+    def save(self, force: bool = False) -> bool:
         if not self.path:
+            return False
+        if self._protect_existing and not force:
+            log.warning("MaxGaffer: auto-save BLOCKED for %s — the previous sidecar "
+                        "failed to load (or is a newer format); call save(force=True) "
+                        "to overwrite deliberately", self.path)
             return False
         payload = {
             "version": FORMAT_VERSION,
@@ -132,13 +194,21 @@ class Session:
             "settings": self.settings,
             "baselines": self.baselines,
         }
+        # per-writer tmp name: two Max instances on the same scene can't tear each
+        # other's write or collide on os.replace
+        tmp = f"{self.path}.{os.getpid()}.tmp"
         try:
-            tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=1)
             os.replace(tmp, self.path)
+            self._protect_existing = False   # a successful explicit save re-arms saving
             return True
-        except OSError:
+        except OSError as e:
+            log.warning("MaxGaffer: session save failed for %s: %s", self.path, e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             return False
 
     # ------------------------------------------------------------------ camera API

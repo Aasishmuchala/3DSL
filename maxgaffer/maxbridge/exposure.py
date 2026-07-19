@@ -56,30 +56,71 @@ def _rt():
     return pymxs.runtime
 
 
-def _find_exposure_control():
-    rt = _rt()
+def _scene_exposure_control():
+    """Whatever is assigned to the scene exposure slot, ANY class (native
+    Photographic/Logarithmic included), None when the slot is truly empty."""
     try:
-        ec = rt.SceneExposureControl.exposureControl
-        if ec is not None and "vray" in str(rt.classOf(ec)).lower():
-            return ec
+        return _rt().SceneExposureControl.exposureControl
     except Exception:
-        pass
+        return None
+
+
+def _find_exposure_control():
+    """The scene's V-RAY exposure control, or None — MaxGaffer only drives V-Ray's."""
+    ec = _scene_exposure_control()
+    if ec is not None and "vray" in str(_rt().classOf(ec)).lower():
+        return ec
     return None
 
 
-def ensure_exposure_control() -> Optional[str]:
-    """Create + assign a V-Ray exposure control when the scene has none (documented call:
-    ``SceneExposureControl.exposureControl = vrayCreateVRayExposureControl()``).
-    Returns a log line, or None if creation isn't available on this build."""
+def ensure_exposure_control(camera=None) -> Optional[str]:
+    """Create + assign an exposure host when the scene slot is EMPTY.
+    An existing NON-V-Ray control is the artist's own exposure setup — it is never
+    clobbered; we say so and let the physical-camera host (or an auto-lock) take over.
+    The creation is wrapped in its own undo record so it is reversible (apply_state's
+    record doesn't cover this call). Returns a log line, or None if a V-Ray EC already
+    exists or creation isn't available on this build.
+
+    Native Physical camera → Max's own Physical_Camera_Exposure_Control: measured
+    on-box 2026-07-16, V-Ray honors the camera's EV AND WB only through it (the VRay
+    EC never applies its WB, and its EV only registers in mode 106 on an offset
+    scale). The host resolver then routes writes to the camera — the doc-verified
+    ``exposure_value`` / ``white_balance_kelvin`` path."""
     if _find_exposure_control() is not None:
         return None
+    existing = _scene_exposure_control()
+    if existing is not None:
+        try:
+            cls = str(_rt().classOf(existing))
+        except Exception:
+            cls = "unknown class"
+        return ("⚠ scene already has a non-V-Ray exposure control "
+                f"({cls}) — leaving it untouched; exposure falls through to the "
+                "physical-camera host (or stays locked)")
+    import pymxs
+
     rt = _rt()
+    try:
+        if (camera is not None
+                and "physical" in str(rt.classOf(camera)).lower()
+                and get_prop(camera, CAM_EV) is not None):
+            with pymxs.undo(True, "MaxGaffer exposure control"):
+                rt.SceneExposureControl.exposureControl = rt.Physical_Camera_Exposure_Control()
+            return ("assigned the Physical Camera Exposure Control — EV/WB now drive "
+                    "through the active Physical camera (scene had no exposure host)")
+    except Exception:
+        pass
     for fn in ("vrayCreateVRayExposureControl",):
         try:
-            ec = getattr(rt, fn)()
-            rt.SceneExposureControl.exposureControl = ec
-            return ("created a V-Ray exposure control (scene had no exposure host) — "
-                    "requires 'Use 3ds Max photometric scale' in V-Ray global switches")
+            with pymxs.undo(True, "MaxGaffer exposure control"):
+                ec = getattr(rt, fn)()
+                rt.SceneExposureControl.exposureControl = ec
+                # mode 106 = "from EV" — measured on-box 2026-07-16: .ev is silently
+                # IGNORED in the default mode (107, from-camera with no camera set)
+                set_prop(ec, EC_MODE, 106)
+            return ("created a V-Ray exposure control (scene exposure slot was empty; "
+                    "undo-safe) — requires 'Use 3ds Max photometric scale' in V-Ray "
+                    "global switches")
         except Exception:
             continue
     return None
@@ -101,6 +142,14 @@ class ExposureHost:
         self.ec = _find_exposure_control()
         self.cam = None
         self.kind = "none"
+        if camera is None:
+            try:
+                # camera-less callers (UI sliders, probes): the active viewport
+                # camera is the artist's context — required since the native
+                # Physical-camera host carries EV/WB on the camera itself
+                camera = _rt().viewport.getCamera()
+            except Exception:
+                camera = None
         if self.ec is not None and get_prop(self.ec, EC_EV) is not None:
             self.kind = "exposure_control"
         elif camera is not None:
@@ -151,6 +200,11 @@ class ExposureHost:
 
     def write_ev(self, ev: float) -> bool:
         if self.kind == "exposure_control":
+            # .ev only registers in "from EV" mode (106) — enforce like the camera
+            # path enforces gain type below (measured on-box 2026-07-16: default
+            # mode 107 silently ignores .ev writes)
+            if get_prop(self.ec, EC_MODE) is not None:
+                set_prop(self.ec, EC_MODE, 106)
             return set_prop(self.ec, EC_EV, float(ev)) is not None
         if self.kind == "physical_cam":
             # preferred: native Target-EV mode — exact, no side effects on DOF/motion

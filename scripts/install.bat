@@ -2,7 +2,9 @@
 rem MaxGaffer one-double-click installer for 3ds Max 2026.
 rem No required pip packages (stdlib floor) — Pillow is installed as an OPTIONAL upgrade
 rem (better JPEG reference ingestion + slimmer LLM payloads); failure there is non-fatal.
-setlocal EnableDelayedExpansion
+rem Delayed expansion stays OFF: it re-scans expanded %%REPO%% at use sites and eats "!"
+rem in clone paths (legal NTFS, e.g. D:\Dropbox!\3DSL) — and nothing here needs it.
+setlocal DisableDelayedExpansion
 
 set "REPO=%~dp0.."
 for %%I in ("%REPO%") do set "REPO=%%~fI"
@@ -32,8 +34,12 @@ copy /Y "%REPO%\maxgaffer\startup\maxgaffer_startup.py" "%STARTUP%\" >nul
 if errorlevel 1 ( echo [!] could not copy the startup script & pause & exit /b 1 )
 
 echo [3/3] recording the clone path...
-"%MAXPY%" -c "import json,os,sys;d=os.path.join(os.environ['LOCALAPPDATA'],'MaxGaffer');os.makedirs(d,exist_ok=True);p=os.path.join(d,'config.json');c=(json.load(open(p)) if os.path.exists(p) else {});c['repo_path']=sys.argv[1];json.dump(c,open(p,'w'),indent=1)" "%REPO%"
+rem A pre-existing CORRUPT config.json (crash-truncated) must not kill this step:
+rem the python starts over from {} instead of dying, and any failure is reported.
+"%MAXPY%" -c "import json,os,sys;d=os.path.join(os.environ['LOCALAPPDATA'],'MaxGaffer');os.makedirs(d,exist_ok=True);p=os.path.join(d,'config.json');c={};exec('try:\n c.update(json.load(open(p)))\nexcept Exception:\n pass') if os.path.exists(p) else None;c['repo_path']=sys.argv[1];json.dump(c,open(p,'w'),indent=1)" "%REPO%"
+if errorlevel 1 echo [!] could not record repo path in config.json — set it later in Settings
 setx MAXGAFFER "%REPO%" >nul
+if errorlevel 1 echo [!] could not setx MAXGAFFER — set it by hand if the plugin does not load
 
 echo(
 echo === done ===

@@ -81,14 +81,14 @@ class _Worker(QtCore.QThread):
     done = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, fn):
-        super().__init__()
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
         self._fn = fn
 
     def run(self):
         try:
             self.done.emit(self._fn())
-        except Exception as e:  # noqa: BLE001
+        except BaseException as e:  # noqa: BLE001 — SystemExit must still free every waiter
             self.failed.emit(str(e))
 
 
@@ -110,10 +110,14 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._workers: List[_Worker] = []
         self._cancel = False
         self._busy = False
+        self._active_camera = ""
         self._sliders: Dict[str, QtWidgets.QDoubleSpinBox] = {}
         self._build()
         self.refresh_cameras()
         self._recover_draft_snapshot()
+        app = QtWidgets.QApplication.instance()
+        if app is not None:                      # drain workers before Qt tears down
+            app.aboutToQuit.connect(self._drain_workers)
 
     def _recover_draft_snapshot(self):
         """A leftover snapshot means Max died mid-match with draft settings applied —
@@ -422,21 +426,49 @@ class MaxGafferDock(QtWidgets.QWidget):
         QtWidgets.QApplication.processEvents()
 
     def _run_blocking_io(self, fn):
-        """Run pure-I/O ``fn`` on a worker while the MAIN thread spins a local event loop —
-        Max stays alive, pymxs is never touched off-thread, exceptions re-raise here."""
-        loop = QtCore.QEventLoop()
+        """Run pure-I/O ``fn`` on a worker while the MAIN thread pumps events in a
+        wait-poll — Max stays alive, pymxs is never touched off-thread, exceptions
+        re-raise here, and Cancel (or an io fn that never returns) can never wedge
+        the nested event loop forever."""
         box = {}
-        w = _Worker(fn)
+        w = _Worker(fn, self)
         self._workers.append(w)
-        w.done.connect(lambda r: (box.__setitem__("r", r), loop.quit()))
-        w.failed.connect(lambda e: (box.__setitem__("e", e), loop.quit()))
+        w.done.connect(lambda r: box.__setitem__("r", r))
+        w.failed.connect(lambda e: box.__setitem__("e", e))
         w.start()
-        loop.exec()
-        w.wait()
-        self._workers.remove(w)
+        while not w.wait(100):
+            QtWidgets.QApplication.processEvents()
+            if self._cancel:
+                break                        # stop blocking; the worker finishes off-thread
+        QtWidgets.QApplication.processEvents()   # drain the queued done/failed signal
+        if w.isRunning():                    # cancelled mid-io — keep tracking it so the
+            w.finished.connect(lambda: self._discard_worker(w))  # dock drains it on close
+        else:
+            self._workers.remove(w)
+        if self._cancel and "r" not in box and "e" not in box:
+            raise RuntimeError("cancelled")
         if "e" in box:
             raise RuntimeError(box["e"])
         return box.get("r")
+
+    def _discard_worker(self, w):
+        if w in self._workers:
+            self._workers.remove(w)
+
+    def _drain_workers(self):
+        """Max is exiting (or the dock is closing) — a QThread finalized while running is
+        a hard 'QThread: Destroyed while thread is still running' abort, so quit+wait."""
+        self._cancel = True
+        for w in list(self._workers):
+            try:
+                w.quit()
+                w.wait(3000)
+            except RuntimeError:
+                pass                         # C++ object already gone
+
+    def closeEvent(self, event):
+        self._drain_workers()
+        super().closeEvent(event)
 
     def _current_camera(self) -> str:
         data = self.cam_combo.currentData() if hasattr(self, "cam_combo") else None
@@ -458,6 +490,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         idx = self.cam_combo.findData(current)
         self.cam_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.cam_combo.blockSignals(False)
+        self._active_camera = self._current_camera()
         try:
             self.act_apply_select.setChecked(
                 bool(self.ctrl.session.settings.get("apply_on_select", True)))
@@ -473,10 +506,16 @@ class MaxGafferDock(QtWidgets.QWidget):
     def _on_camera_combo(self, _idx: int):
         if self._busy:
             self._log("busy — camera switch ignored until the current run finishes")
+            idx = self.cam_combo.findData(self._active_camera)
+            if idx >= 0:                     # point the combo back at the camera actually running
+                self.cam_combo.blockSignals(True)
+                self.cam_combo.setCurrentIndex(idx)
+                self.cam_combo.blockSignals(False)
             return
         name = self._current_camera()
         if not name:
             return
+        self._active_camera = name
         self._ab_on_pre = False
         try:
             for w in self.ctrl.select_camera(name):
@@ -493,6 +532,8 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= reference
     def _pick_reference(self):
+        if self._busy:
+            return
         cam = self._current_camera()
         if not cam:
             self._log("select a camera first")
@@ -520,8 +561,10 @@ class MaxGafferDock(QtWidgets.QWidget):
                 info = os.path.basename(ref)
                 if e and e.semantics:
                     s = e.semantics
-                    info += (f"\n{s.get('time_of_day')}, {s.get('sky')} sky, "
-                             f"wb ~{s.get('wb_kelvin_estimate', 0):.0f}K")
+                    info += f"\n{s.get('time_of_day')}, {s.get('sky')} sky"
+                    wb = s.get("wb_kelvin_estimate")
+                    if isinstance(wb, (int, float)):   # sidecar is human-editable —
+                        info += f", wb ~{wb:.0f}K"     # only format real numerics
                 if e and e.score is not None:
                     info += f"\nlast match: {e.score:.1f}/100 at {e.matched_at}"
                 self.lbl_ref_info.setText(info)
@@ -581,7 +624,12 @@ class MaxGafferDock(QtWidgets.QWidget):
             self, "Dome HDRI", "", "HDR images (*.hdr *.exr *.jpg *.png *.tif)")
         if not path:
             return
-        how = self.ctrl.set_dome_hdri(path)
+        try:
+            how = self.ctrl.set_dome_hdri(path)
+        except Exception as e:  # noqa: BLE001 — a stale rig (deleted dome) must not
+            self._log(f"✗ HDRI: {e}")        # escape the slot
+            self.rebuild_rig_controls()
+            return
         self._log(f"dome HDRI → {os.path.basename(path)} ({how})" if how != "failed"
                   else "✗ could not set the dome texture (no dome, or unknown file prop — "
                        "checklist #16)")
@@ -874,12 +922,16 @@ class MaxGafferDock(QtWidgets.QWidget):
         if self._busy:
             return
         cam = self._current_camera()
-        if cam and self.ctrl.restore_pre_match(cam):
-            self._log(f"restored pre-match lighting for {cam}")
-            self._ab_on_pre = True
+        try:
+            if cam and self.ctrl.restore_pre_match(cam):
+                self._log(f"restored pre-match lighting for {cam}")
+                self._ab_on_pre = True
+            else:
+                self._log("no pre-match snapshot for this camera yet")
+        except Exception as e:  # noqa: BLE001 — a light deleted since the snapshot must
+            self._log(f"✗ restore: {e}")     # not escape the slot half-way
+        finally:
             self.rebuild_rig_controls()
-        else:
-            self._log("no pre-match snapshot for this camera yet")
 
     def _ab_flip(self):
         if self._busy:
@@ -920,7 +972,9 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not out_dir:
             return
         self._busy = True
-        try:
+        self._cancel = False
+        self.btn_cancel.setEnabled(True)     # finals can wedge for an hour per CLI job —
+        try:                                 # Cancel must reach the io wait-poll
             if self.cfg.final_render_backend == "vantage_cli":
                 # Developer-Edition CLI only — exports main-thread, renders on a worker
                 jobs = self.ctrl.prepare_vantage_jobs(
@@ -939,6 +993,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log(f"✗ final renders: {e}")
         finally:
             self._busy = False
+            self.btn_cancel.setEnabled(False)
 
     def _export_for_vantage(self):
         if self._busy:
@@ -966,9 +1021,12 @@ class MaxGafferDock(QtWidgets.QWidget):
     def _open_settings(self):
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec():
-            self.cfg.save()
             self.ctrl.cfg = self.cfg
-            self._log("settings saved")
+            try:
+                self.cfg.save()
+                self._log("settings saved")
+            except OSError as e:             # read-only profile / locked config.json
+                self._log(f"✗ settings not persisted: {e} — changes live this session only")
 
 
 class ScenarioBoardDialog(QtWidgets.QDialog):
@@ -1175,9 +1233,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.lbl_status.setObjectName("dim")
         form.addRow(self.lbl_status)
         btns = QtWidgets.QHBoxLayout()
-        b_test = QtWidgets.QPushButton("Test gateway")
-        b_test.clicked.connect(self._test)
-        btns.addWidget(b_test)
+        self.btn_test = QtWidgets.QPushButton("Test gateway")
+        self.btn_test.clicked.connect(self._test)
+        btns.addWidget(self.btn_test)
         b_ok = QtWidgets.QPushButton("Save")
         b_ok.setObjectName("primary")
         b_ok.clicked.connect(self._save)
@@ -1188,15 +1246,26 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow(btns)
 
     def _test(self):
+        """Ping the gateway OFF Max's main thread (SPEC §2 threading is law): the dock's
+        injectable io worker runs the blocking call, the dialog stays responsive, and
+        the result lands in the status label when the worker finishes."""
+        key = self.ed_key.text().strip()
+        model = self.ed_model.text().strip()
         self.lbl_status.setText("pinging…")
-        QtWidgets.QApplication.processEvents()
+        self.btn_test.setEnabled(False)
         try:
-            self.lbl_status.setText(ping(self.ed_key.text().strip(),
-                                         self.ed_model.text().strip()))
+            io_runner = getattr(self.parent(), "_run_blocking_io", None)
+            run = io_runner or (lambda fn: fn())   # standalone use: no pump available
+            self.lbl_status.setText(run(lambda: ping(key, model)))
             self.lbl_status.setStyleSheet(f"color:{OK};")
         except OmegaError as e:
             self.lbl_status.setText(str(e))
             self.lbl_status.setStyleSheet(f"color:{ERR};")
+        except RuntimeError as e:                  # the io relay re-raises worker failures
+            self.lbl_status.setText(str(e))        # as RuntimeError — same typed message
+            self.lbl_status.setStyleSheet(f"color:{ERR};")
+        finally:
+            self.btn_test.setEnabled(True)
 
     def _save(self):
         self.cfg.api_key = self.ed_key.text().strip()
@@ -1211,11 +1280,12 @@ class SettingsDialog(QtWidgets.QDialog):
 
 
 _dock_instance: Optional[MaxGafferDock] = None
+_dock_wrapper: Optional[QtWidgets.QWidget] = None  # the QDockWidget host (or the window)
 
 
 def show_dock():
     """Create (or raise) the dock inside 3ds Max's main window."""
-    global _dock_instance
+    global _dock_instance, _dock_wrapper
     parent = None
     try:
         import qtmax  # Max 2021+
@@ -1223,12 +1293,16 @@ def show_dock():
         parent = qtmax.GetQMaxMainWindow()
     except Exception:
         parent = None
-    if _dock_instance is not None:
+    if _dock_wrapper is not None:
         try:
-            _dock_instance.show()
-            _dock_instance.raise_()
-            return _dock_instance
-        except RuntimeError:
+            # closing the dock's X only HIDES the QDockWidget — re-show the WRAPPER
+            # (showing the inner widget alone can never un-hide its host)
+            _dock_wrapper.show()
+            _dock_wrapper.raise_()
+            if _dock_instance is not None:
+                return _dock_instance
+        except RuntimeError:                 # C++ object deleted (Max shutdown, teardown)
+            _dock_wrapper = None             # — fall through and rebuild cleanly
             _dock_instance = None
     if parent is not None:
         dock = QtWidgets.QDockWidget("MaxGaffer", parent)
@@ -1239,9 +1313,11 @@ def show_dock():
         dock.setFloating(True)
         dock.resize(1040, 1100)
         dock.show()
+        _dock_wrapper = dock
         _dock_instance = widget
     else:  # dev fallback: plain window
         _dock_instance = MaxGafferDock()
         _dock_instance.resize(1040, 1100)
         _dock_instance.show()
+        _dock_wrapper = _dock_instance
     return _dock_instance

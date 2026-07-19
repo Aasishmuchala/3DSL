@@ -17,6 +17,7 @@ Pure python, zero pymxs. The bridge renders; this builds.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Set
 
 from . import rules
@@ -77,6 +78,41 @@ VARIANTS = (
 )
 
 
+# numeric ANALYZE fields with their accepted ranges (mirror parse.validate_analysis): a
+# hand-edited/corrupted sidecar cache reaches here RAW — json.load accepts NaN/Infinity
+# literals — and rules.initial_state would float() them straight into genome.clamp, whose
+# wrap path (fmod(nan, 360) = nan) lets a NaN azimuth ride all the way into a scene write
+_NUMERIC_BOUNDS = {
+    "sun_bearing_deg": (-180.0, 180.0),
+    "wb_kelvin_estimate": (2000.0, 15000.0),
+    "confidence": (0.0, 1.0),
+}
+
+
+def sanitize_semantics(semantics: Optional[Dict]) -> Dict:
+    """Cached-semantics gate: drop anything rules.initial_state can't safely consume —
+    NaN/±inf, non-numeric numerics, non-scalar junk. Out-of-range numbers are clamped
+    (the same move parse._num makes on the live-LLM path); rejected keys fall back to
+    the DEFAULT_SEMANTICS base instead of corrupting the board."""
+    out: Dict = {}
+    for k, v in (semantics or {}).items():
+        if k in _NUMERIC_BOUNDS:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(f):
+                continue
+            lo, hi = _NUMERIC_BOUNDS[k]
+            out[k] = min(hi, max(lo, f))
+        elif isinstance(v, bool) or isinstance(v, str) or v is None:
+            out[k] = v
+        elif isinstance(v, (int, float)) and math.isfinite(v):
+            out[k] = v
+        # anything else (dict/list/non-finite float) isn't ANALYZE vocabulary — drop it
+    return out
+
+
 def build_scenarios(
     semantics: Optional[Dict],
     current: LightingState,
@@ -96,7 +132,8 @@ def build_scenarios(
     base = dict(DEFAULT_SEMANTICS)
     have_ref = bool(semantics)
     if have_ref:
-        base.update({k: v for k, v in semantics.items() if v is not None})
+        base.update({k: v for k, v in sanitize_semantics(semantics).items()
+                     if v is not None})
     out: List[Dict] = []
     for key, label, why, overrides in VARIANTS:
         if key == "as_analyzed" and not have_ref:

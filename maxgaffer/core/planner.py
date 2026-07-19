@@ -18,6 +18,7 @@ Pure python; unit-tested off-Max.
 from __future__ import annotations
 
 import json
+import math
 from typing import Dict, List, Sequence, Set, Tuple
 
 from .omega import parse_json_from_text
@@ -82,12 +83,14 @@ def plan_user_text(digest_text: str, semantics: Dict, camera_name: str) -> str:
 
 
 def _valid_value(v) -> bool:
-    if isinstance(v, bool) or isinstance(v, (int, float)):
+    if isinstance(v, bool):
         return True
+    if isinstance(v, (int, float)):
+        return math.isfinite(v)             # NaN/±inf must never reach a scene setattr
     if isinstance(v, str):
         return len(v) < 500
     if (isinstance(v, (list, tuple)) and len(v) == 3
-            and all(isinstance(x, (int, float)) for x in v)):
+            and all(isinstance(x, (int, float)) and math.isfinite(x) for x in v)):
         return True
     return False
 

@@ -52,71 +52,89 @@ def pending_snapshot() -> bool:
 
 
 def apply_draft() -> List[str]:
-    """Snapshot originals to disk, then apply draft values. Returns log lines.
+    """Snapshot originals to disk FIRST, then apply draft values. Returns log lines.
     A pre-existing snapshot means a crashed session — it is NOT overwritten (the oldest
-    snapshot is the true original); we restore it first, then re-apply."""
+    snapshot is the true original); we restore it first, then re-apply.
+
+    Two passes, strictly ordered: collect every original → write the crash-safe file →
+    only THEN mutate the renderer. A crash before the write leaves the scene untouched;
+    a crash after it leaves a complete recovery file. If the file can't be written,
+    nothing has been touched and draft mode aborts."""
     lines: List[str] = []
     if pending_snapshot():
         lines += restore_draft()
     r = _renderer()
     if r is None:
         return lines + ["draft: no current renderer — skipped"]
-    snapshot: Dict[str, float] = {}
+    # pass 1 — collect originals, no mutation
+    originals: Dict[str, float] = {}
+    planned: List[Tuple[str, float]] = []     # (name, coerced draft value)
     for candidates, draft_value in DRAFT_PROPS:
         for name in candidates:
             original = get_prop(r, (name,))
             if original is None:
                 continue
             try:
-                snapshot[name] = float(original)
+                originals[name] = float(original)
             except (TypeError, ValueError):
                 break
-            set_prop(r, (name,), type(original)(draft_value)
-                     if isinstance(original, int) else float(draft_value))
-            lines.append(f"draft: {name} {snapshot[name]:g} → {draft_value:g}")
+            planned.append((name, type(original)(draft_value)
+                            if isinstance(original, int) else float(draft_value)))
             break
-    if not snapshot:
+    if not originals:
         return lines + ["draft: no known sampler properties on this renderer — "
                         "nothing changed (checklist #15)"]
+    # crash-safe snapshot BEFORE any set_prop — the module's whole contract
     try:
         with open(SNAPSHOT_PATH, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, indent=1)
+            json.dump(originals, f, indent=1)
     except OSError:
-        # can't guarantee crash-safety → put everything back and refuse
-        for name, value in snapshot.items():
-            set_prop(r, (name,), value)
         return lines + ["draft: could not write the safety snapshot — draft mode ABORTED, "
                         "settings untouched"]
+    # pass 2 — apply, per-prop fault-isolated; only log a change that actually happened
+    for name, draft_value in planned:
+        applied = set_prop(r, (name,), draft_value)
+        if applied:
+            lines.append(f"draft: {name} {originals[name]:g} → {draft_value:g}")
+        else:
+            lines.append(f"draft: {name} would not take the draft value — left at "
+                         f"{originals[name]:g}")
     return lines
 
 
 def restore_draft() -> List[str]:
-    """Put the snapshotted originals back and delete the snapshot. Safe to call anytime."""
+    """Put the snapshotted originals back and delete the snapshot. Safe to call anytime.
+    Never raises: one bad value or prop must not strand the rest, and the snapshot file
+    is cleared no matter what (a leftover file re-fails recovery at every launch)."""
     if not pending_snapshot():
         return []
     lines: List[str] = []
     try:
-        with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
-            snapshot = json.load(f)
-    except (OSError, ValueError):
-        return ["draft: snapshot unreadable — render settings may need a manual check"]
-    r = _renderer()
-    if r is not None and isinstance(snapshot, dict):
-        for name, value in snapshot.items():
-            # per-prop isolation: if the RENDERER changed between crash and relaunch,
-            # a prop can be gone (current=None) — type(None)(value) used to raise here,
-            # abandoning the remaining restores AND the snapshot file
-            try:
-                current = get_prop(r, (name,))
-                coerced = (type(current)(value) if isinstance(current, int)
-                           else float(value))
-                restored = set_prop(r, (name,), coerced)
-            except Exception:  # noqa: BLE001 one lost prop must not strand the rest
-                restored = None
-            lines.append(f"draft: restored {name} → {value:g}"
-                         if restored else f"draft: could not restore {name}")
-    try:
-        os.remove(SNAPSHOT_PATH)
-    except OSError:
-        pass
-    return lines
+        try:
+            with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+                snapshot = json.load(f)
+        except (OSError, ValueError):
+            return ["draft: snapshot unreadable — render settings may need a manual check"]
+        r = _renderer()
+        if r is not None and isinstance(snapshot, dict):
+            for name, value in snapshot.items():
+                # per-prop isolation: if the RENDERER changed between crash and relaunch,
+                # a prop can be gone (current=None) — type(None)(value) used to raise here,
+                # abandoning the remaining restores AND the snapshot file. The value may
+                # also be a string (hand-edited file) — format the COERCED float, never
+                # the raw entry.
+                try:
+                    current = get_prop(r, (name,))
+                    coerced = (type(current)(float(value)) if isinstance(current, int)
+                               else float(value))
+                    restored = set_prop(r, (name,), coerced)
+                except Exception:  # noqa: BLE001 one lost prop must not strand the rest
+                    restored = None
+                lines.append(f"draft: restored {name} → {coerced:g}"
+                             if restored else f"draft: could not restore {name}")
+        return lines
+    finally:
+        try:
+            os.remove(SNAPSHOT_PATH)
+        except OSError:
+            pass

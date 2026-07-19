@@ -23,9 +23,18 @@ def _rt():
 
 
 def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str]:
-    """One still through the CURRENT renderer at the given size. Returns path or None."""
+    """One still through the CURRENT renderer at the given size. Returns path or None.
+
+    A pre-existing target is deleted before rendering, so success can never be a stale
+    file from an earlier run; the bitmap is closed in a finally, so a failed ``save``
+    leaks no framebuffer."""
     rt = _rt()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    try:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+    except OSError:
+        pass
     old_w, old_h = None, None
     try:
         try:
@@ -33,6 +42,12 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
         except Exception:
             pass
         old_w, old_h = int(rt.renderWidth), int(rt.renderHeight)
+        try:
+            # sky/background pixels carry alpha 0 — saved as-is the LLM sees a
+            # transparent (often white-composited) sky. Flatten at the PNG writer.
+            rt.pngio.setAlpha(False)
+        except Exception:
+            pass
         # render()'s size-arg spelling varies across Max releases — a single spelling here
         # would be a single point of failure for EVERY loop render. Layered candidates:
         # outputwidth/height kwargs → outputSize:Point2 → the globals (restored in finally).
@@ -52,12 +67,18 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
         if bm is None:
             rt.renderWidth, rt.renderHeight = int(width), int(height)
             bm = rt.render(camera=camera, vfb=False, quiet=True)
-        if bm is None:
-            return None
-        bm.filename = out_path
-        rt.save(bm)
-        rt.close(bm)
-        return out_path if os.path.exists(out_path) else None
+        try:
+            if bm is None:
+                return None
+            bm.filename = out_path
+            rt.save(bm)
+            return out_path if os.path.exists(out_path) else None
+        finally:                       # a throwing save must not leak the framebuffer
+            if bm is not None:
+                try:
+                    rt.close(bm)
+                except Exception:
+                    pass
     except Exception:
         return None
     finally:

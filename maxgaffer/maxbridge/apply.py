@@ -16,6 +16,8 @@ from ..core.genome import LightingState
 from . import scene as sc
 from .exposure import ExposureHost
 
+BASELINE_EPSILON = 1e-4  # at/below this a captured value is "dimmed", not "authored"
+
 
 def _rt():
     import pymxs
@@ -30,10 +32,45 @@ def _light_name(node) -> str:
         return ""
 
 
-def capture_baselines(rig: Dict[str, Any]) -> Dict[str, float]:
+def _baseline_of(baselines: Dict[str, float], name: str) -> float:
+    """A light's authored multiplier — never ~0 (a 0 baseline is dimmer-poison, not an
+    authored value; capture and adoption both refuse it). Read and apply paths share this
+    helper so an adopted baseline behaves identically in both directions."""
+    try:
+        base = float(baselines.get(name, 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    return base if abs(base) > BASELINE_EPSILON else 1.0
+
+
+def _state_float(state: LightingState, key: str, warnings: List[str]):
+    """float() of a state value, fault-isolated — states are clamped floats via set()/
+    from_dict, but the dicts are public, so a bad raw value downgrades to a warning
+    instead of detonating inside the undo record. None = skip this param."""
+    try:
+        return float(state.get(key))
+    except (TypeError, ValueError):
+        warnings.append(f"{key}: non-numeric value {state.get(key)!r} — skipped")
+        return None
+
+
+class CaptureResult(dict):
+    """Plain {light_name: multiplier} dict PLUS ``.notes`` — the skip reasons the caller
+    should surface in the log. Subclasses dict so existing consumers
+    (``Session.adopt_baselines``, on-box scripts) take it unchanged."""
+    def __init__(self, *args, notes: List[str] = (), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.notes: List[str] = list(notes)
+
+
+def capture_baselines(rig: Dict[str, Any]) -> CaptureResult:
     """{light_name: current multiplier} for every group light — a CANDIDATE set. Feed it
-    through ``Session.adopt_baselines`` (adopt-only-new); never use it to overwrite."""
+    through ``Session.adopt_baselines`` (adopt-only-new); never use it to overwrite.
+    A light currently at ~0 is almost certainly DIMMED, not authored that way — adopting
+    0 would poison the group (0 × factor is 0 forever), so it is skipped with a note in
+    ``.notes`` (the artist can re-author explicitly via ``forget_baseline``)."""
     out: Dict[str, float] = {}
+    notes: List[str] = []
     for lights in (rig.get("groups") or {}).values():
         for lt in lights:
             name = _light_name(lt)
@@ -41,10 +78,16 @@ def capture_baselines(rig: Dict[str, Any]) -> Dict[str, float]:
                 continue
             v = sc.get_prop(lt, sc.LIGHT_MULT, 1.0)
             try:
-                out[name] = float(v)
+                mult = float(v)
             except (TypeError, ValueError):
-                out[name] = 1.0
-    return out
+                mult = 1.0
+            if abs(mult) <= BASELINE_EPSILON:
+                notes.append(f"baseline: light '{name}' reads {mult:g} — declining to "
+                             "capture a ~0 baseline (likely dimmed, not authored); use "
+                             "forget_baseline to force a re-author")
+                continue
+            out[name] = mult
+    return CaptureResult(out, notes=notes)
 
 
 def read_state(rig: Dict[str, Any], baselines: Dict[str, float],
@@ -80,7 +123,7 @@ def read_state(rig: Dict[str, Any], baselines: Dict[str, float],
     for group, lights in (rig.get("groups") or {}).items():
         factors: List[float] = []
         for lt in lights:
-            base = baselines.get(_light_name(lt), 1.0) or 1.0
+            base = _baseline_of(baselines, _light_name(lt))
             v = sc.get_prop(lt, sc.LIGHT_MULT, base)
             try:
                 factors.append(float(v) / base)
@@ -120,8 +163,10 @@ def _apply_inner(rig, baselines, state: LightingState, camera, warnings: List[st
     sun = rig.get("sun")
     if sun is not None:
         if "sun.enabled" in state.values:
-            if sc.set_prop(sun, sc.LIGHT_ON, bool(state.get("sun.enabled") >= 0.5)) is None:
-                warnings.append("sun on/off property not found")
+            enabled = _state_float(state, "sun.enabled", warnings)
+            if enabled is not None:
+                if sc.set_prop(sun, sc.LIGHT_ON, bool(enabled >= 0.5)) is None:
+                    warnings.append("sun on/off property not found")
         if "sun.azimuth_deg" in state.values or "sun.altitude_deg" in state.values:
             az = state.get("sun.azimuth_deg", sc.read_sun_angles(sun)[0])
             alt = state.get("sun.altitude_deg", sc.read_sun_angles(sun)[1])
@@ -131,27 +176,40 @@ def _apply_inner(rig, baselines, state: LightingState, camera, warnings: List[st
                            ("sun.size", sc.SUN_SIZE),
                            ("sun.turbidity", sc.SUN_TURBIDITY)):
             if key in state.values:
-                if sc.set_prop(sun, props, float(state.get(key))) is None:
-                    warnings.append(f"{key}: no matching property on VRaySun")
+                value = _state_float(state, key, warnings)
+                if value is not None:
+                    if sc.set_prop(sun, props, value) is None:
+                        warnings.append(f"{key}: no matching property on VRaySun")
     elif any(k.startswith("sun.") for k in state.values):
         warnings.append("state has sun.* but the rig has no VRaySun")
 
     dome = rig.get("dome")
     if dome is not None:
         if "dome.enabled" in state.values:
-            sc.set_prop(dome, sc.LIGHT_ON, bool(state.get("dome.enabled") >= 0.5))
+            enabled = _state_float(state, "dome.enabled", warnings)
+            if enabled is not None:
+                sc.set_prop(dome, sc.LIGHT_ON, bool(enabled >= 0.5))
         if "dome.intensity" in state.values:
-            if sc.set_prop(dome, sc.LIGHT_MULT, float(state.get("dome.intensity"))) is None:
-                warnings.append("dome.intensity: no multiplier property")
+            intensity = _state_float(state, "dome.intensity", warnings)
+            if intensity is not None:
+                if sc.set_prop(dome, sc.LIGHT_MULT, intensity) is None:
+                    warnings.append("dome.intensity: no multiplier property")
         if "dome.rotation_deg" in state.values:
             how = sc.write_dome_rotation(dome, state.get("dome.rotation_deg"))
             if how == "failed":
                 warnings.append("dome.rotation_deg: could not rotate texmap or node")
 
     for group, factor in state.groups.items():
-        for lt in (rig.get("groups") or {}).get(group, []):
-            base = baselines.get(_light_name(lt), 1.0)
-            if sc.set_prop(lt, sc.LIGHT_MULT, float(base) * float(factor)) is None:
+        lights = (rig.get("groups") or {}).get(group, [])
+        try:
+            factor = float(factor)
+        except (TypeError, ValueError):
+            if lights:
+                warnings.append(f"group.{group}: non-numeric factor {factor!r} — skipped")
+            continue
+        for lt in lights:
+            base = _baseline_of(baselines, _light_name(lt))
+            if sc.set_prop(lt, sc.LIGHT_MULT, base * factor) is None:
                 warnings.append(f"group.{group}: light '{getattr(lt, 'name', '?')}' "
                                 "has no multiplier")
 

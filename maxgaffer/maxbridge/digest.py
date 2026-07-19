@@ -93,7 +93,11 @@ def build_digest() -> Dict[str, Any]:
         pass
 
     try:
-        for lt in rt.lights:
+        lights = list(rt.lights)
+    except Exception:
+        lights = []
+    for lt in lights:
+        try:
             cname = str(rt.classOf(lt)).lower()
             if cname == "targetobject":
                 continue
@@ -108,13 +112,25 @@ def build_digest() -> Dict[str, Any]:
             except Exception:
                 pass
             digest["lights"].append(entry)
-    except Exception:
-        pass
+        except Exception as e:
+            # one hostile node (stale handle, exotic plugin light) must not abort
+            # enumeration of every remaining light — record it and CONTINUE
+            try:
+                nm = str(lt.name)
+            except Exception:
+                nm = "?"
+            digest["lights"].append({"name": nm, "class": "?", "props": {},
+                                     "layer": "?",
+                                     "error": f"unreadable light skipped: {e}"})
 
     for cam in sc.list_cameras():
         node = sc.get_camera(cam["name"])
         entry: Dict[str, Any] = {"name": cam["name"], "class": cam["class"],
                                  "yaw_deg": round(cam["yaw_deg"], 1)}
+        if cam.get("duplicate"):
+            entry["note"] = (f"duplicate name — several cameras are called "
+                             f"'{cam['name']}'; MaxGaffer always uses the FIRST in "
+                             "scene order")
         if node is not None:
             try:
                 entry["pos"] = _norm(node.pos)

@@ -38,6 +38,10 @@ from . import vantage as vt
 # formats Max reads natively but Pillow/stdlib can't — always ingest via Max transcode
 MAX_FIRST_EXTS = (".exr", ".hdr", ".tif", ".tiff")
 
+# director's notes are persisted AND pinned into every DELTAS prompt of the ensemble and
+# the whole deep match — cap their SIZE (the [-6:] list cap only bounds their count)
+MAX_NOTE_CHARS = 500
+
 
 def _needs_max_ingest(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in MAX_FIRST_EXTS
@@ -52,6 +56,7 @@ class Controller:
         self._baselines: Dict[str, float] = {}   # light NAME → authored multiplier
         self._ref_cache: Dict[str, Dict] = {}     # ref path+mtime → stats
         self._run_dir: Optional[str] = None
+        self._last_analyze_agreement: Optional[float] = None
         # pure-I/O runner — the UI swaps in a worker-thread pump so gateway waits never
         # freeze Max; pymxs is NEVER called through this (network/subprocess only)
         self.io: Callable = lambda fn: fn()
@@ -68,6 +73,13 @@ class Controller:
     def save_session(self) -> bool:
         self.session.path = sidecar_path(sc.scene_path())   # scene may have been saved-as
         return self.session.save()
+
+    def _save_or_warn(self, log: Callable[[str], None]) -> None:
+        """save_session + the SPEC-mandated LOUD warning when persistence is off or
+        failed (unsaved / read-only scene): everything then lives in memory ONLY."""
+        if not self.save_session():
+            log("⚠ session NOT saved (unsaved or read-only scene) — states, snapshots "
+                "and notes live in memory only and vanish when the scene closes")
 
     def rig(self, refresh: bool = False):
         if self._rig is None or refresh:
@@ -119,7 +131,8 @@ class Controller:
         if dome is None:
             return
         if sc.get_dome_texture(dome) != e.seed_hdri:
-            sc.set_dome_texture(dome, e.seed_hdri)
+            with self._dome_undo():
+                sc.set_dome_texture(dome, e.seed_hdri)
 
     # ------------------------------------------------------------------ stats providers
     def stats_for(self, path: str) -> Optional[Dict]:
@@ -170,7 +183,10 @@ class Controller:
     def _transcode_ref(self, ref_path: str) -> Optional[str]:
         png = os.path.join(self._ensure_run_dir("refs"),
                            "ref_" + _safe(os.path.basename(ref_path)) + ".png")
-        return rd.transcode_to_png(ref_path, png)
+        out = rd.transcode_to_png(ref_path, png)
+        if out:
+            prune_old_files(os.path.dirname(png), keep=int(self.cfg.keep_runs))
+        return out
 
     # ------------------------------------------------------------------ LLM plumbing
     def _image_block(self, path: str) -> Optional[dict]:
@@ -180,6 +196,7 @@ class Controller:
             png = os.path.join(self._ensure_run_dir("refs"),
                                "llm_" + _safe(os.path.basename(path)) + ".png")
             if rd.transcode_to_png(path, png, max_dim=768):
+                prune_old_files(os.path.dirname(png), keep=int(self.cfg.keep_runs))
                 return omega.image_block_from_file(png)
             return None
         try:
@@ -219,6 +236,7 @@ class Controller:
         png = os.path.join(self._ensure_run_dir("refs"),
                            "llm_" + os.path.basename(path) + ".png")
         if rd.transcode_to_png(path, png, max_dim=768):
+            prune_old_files(os.path.dirname(png), keep=int(self.cfg.keep_runs))
             return omega.image_block_from_file(png)
         return None
 
@@ -228,10 +246,14 @@ class Controller:
         if not e.reference:
             raise RuntimeError("no reference image bound to this camera")
         if e.semantics:
+            # cached read — clear any stale contest flag so a LATER camera's run never
+            # logs this camera's (or an older run's) disagreement
+            self._last_analyze_agreement = None
             return e.semantics
-        block = self._image_block(e.reference)
+        ref_path = e.reference   # pinned: the gateway waits below are click-windows
+        block = self._image_block(ref_path)
         if block is None:
-            raise RuntimeError(f"could not read reference image: {e.reference}")
+            raise RuntimeError(f"could not read reference image: {ref_path}")
         messages = [{"role": "user",
                      "content": [block, omega.text_block(prompts.analyze_user_text())]}]
         # self-consistency: N independent reads, consolidated (majority/median/circular
@@ -257,10 +279,15 @@ class Controller:
                 self.cfg.api_key, prompts.ANALYZE_SYSTEM, retry,
                 model=self.cfg.model, max_tokens=2048))))
         semantics = consensus.consolidate_analyses(samples)
-        agreement = semantics.pop("consensus_agreement", 1.0)
-        if len(samples) > 1 and agreement < 1.0:
-            # keep it out of the cached dict but tell the human the read was contested
-            self._last_analyze_agreement = agreement
+        agreement = semantics.pop("consensus_agreement", 1.0)   # kept out of the cache
+        if e.reference != ref_path:
+            # the reference was swapped during a gateway wait — caching the OLD image's
+            # read against the NEW path would poison every later run of this camera
+            raise RuntimeError("reference image changed while analyzing — run again to "
+                               "analyze the new reference")
+        # unconditional: a fresh 100% agreement must CLEAR a contested flag left by an
+        # earlier analysis (same or another camera), or run_match logs a ghost warning
+        self._last_analyze_agreement = agreement
         e.semantics = semantics
         self.save_session()
         return semantics
@@ -408,9 +435,11 @@ class Controller:
             from .exposure import ExposureHost, ensure_exposure_control
 
             if ExposureHost(cam).kind == "none":
-                created = ensure_exposure_control()
+                created = ensure_exposure_control(camera=cam)
                 if created:
                     log("⚠ " + created)
+                    # remember WE created it — Restore must exit the experiment entirely
+                    e.ec_created = True
         locks = set(locks if locks is not None else e.locks)
         run_dir = self._new_run_dir(camera_name)
         log(f"run dir: {run_dir}")
@@ -423,7 +452,7 @@ class Controller:
         self._plan_snapped = None
         if snapped_for != camera_name:
             e.pre_match = ap.read_state(rig, self._baselines, cam)
-        self.save_session()
+        self._save_or_warn(log)
 
         log("analyzing reference…")
         semantics = self.analyze_reference(camera_name)
@@ -432,11 +461,14 @@ class Controller:
             f"{semantics['sun_bearing_deg']:+.0f}°, wb ~{semantics['wb_kelvin_estimate']:.0f}K"
             f" — {semantics['key_notes']}")
 
-        ref_stats = self.ref_stats(e.reference)
+        # pinned AFTER analyze (its io waits are click-windows): all remaining run
+        # inputs derive from ONE reference, never a mid-run swap
+        ref_path = e.reference
+        ref_stats = self.ref_stats(ref_path)
         if ref_stats is None:
             log("⚠ reference stats unavailable (install Pillow or set system_python) — "
                 "running LLM-visual mode")
-        ref_block = self._image_block(e.reference)
+        ref_block = self._image_block(ref_path)
         if ref_block is None:
             raise RuntimeError("reference image could not be prepared for the LLM")
 
@@ -473,42 +505,45 @@ class Controller:
             should_cancel=should_cancel,
         )
 
-        agreement = getattr(self, "_last_analyze_agreement", None)
-        if agreement is not None and agreement < 1.0:
-            log(f"⚠ analyze samples disagreed (agreement {agreement:.0%}) — consensus "
-                "used; consider a cleaner reference if the match fights you")
-            self._last_analyze_agreement = None
-
-        if do_sweep and start_override is None and rig.get("sun") is not None \
-                and "sun.azimuth_deg" not in locks:
-            log(f"sun sweep: {self.cfg.sweep_count} directions…")
-            az, alt_hint, _why = run_sun_sweep(
-                start, rules.sweep_azimuths(self.cfg.sweep_count), hooks,
-                llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs),
-                ref_stats=ref_stats)
-            if az is not None:
-                start.set("sun.azimuth_deg", az)
-                # the hint was judged against real renders of THIS scene — trust it over
-                # the ANALYZE band when the altitude isn't locked
-                if alt_hint != "na" and "sun.altitude_deg" not in locks \
-                        and "sun.altitude_deg" in start.values:
-                    start.set("sun.altitude_deg", rules.ALTITUDE_DEG.get(
-                        alt_hint, start.get("sun.altitude_deg")))
-                    log(f"sweep: altitude refined to "
-                        f"{start.get('sun.altitude_deg'):.0f}° ('{alt_hint}')")
-
-        cfg = MatchConfig(
-            max_iterations=(max(int(self.cfg.max_iterations), 10) if deep
-                            else int(self.cfg.max_iterations)),
-            target_score=99.0 if deep else float(self.cfg.target_score),
-            analytic=ref_stats is not None,
-            weights=self.cfg.critic_weights or None,
-            polish=deep,
-        )
-        if deep:
-            log(f"DEEP MATCH: target 99 · up to {cfg.max_iterations} iterations · "
-                "coordinate-descent polish to the scene's ceiling afterwards")
+        # the restoring finally opens IMMEDIATELY after the draft is applied: a gateway
+        # error in the sweep or a bad config value in the MatchConfig build must never
+        # strand the artist's sampler settings for the rest of the Max session
         try:
+            agreement = getattr(self, "_last_analyze_agreement", None)
+            if agreement is not None and agreement < 1.0:
+                log(f"⚠ analyze samples disagreed (agreement {agreement:.0%}) — consensus "
+                    "used; consider a cleaner reference if the match fights you")
+                self._last_analyze_agreement = None
+
+            if do_sweep and start_override is None and rig.get("sun") is not None \
+                    and "sun.azimuth_deg" not in locks:
+                log(f"sun sweep: {self.cfg.sweep_count} directions…")
+                az, alt_hint, _why = run_sun_sweep(
+                    start, rules.sweep_azimuths(self.cfg.sweep_count), hooks,
+                    llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs),
+                    ref_stats=ref_stats)
+                if az is not None:
+                    start.set("sun.azimuth_deg", az)
+                    # the hint was judged against real renders of THIS scene — trust it over
+                    # the ANALYZE band when the altitude isn't locked
+                    if alt_hint != "na" and "sun.altitude_deg" not in locks \
+                            and "sun.altitude_deg" in start.values:
+                        start.set("sun.altitude_deg", rules.ALTITUDE_DEG.get(
+                            alt_hint, start.get("sun.altitude_deg")))
+                        log(f"sweep: altitude refined to "
+                            f"{start.get('sun.altitude_deg'):.0f}° ('{alt_hint}')")
+
+            cfg = MatchConfig(
+                max_iterations=(max(int(self.cfg.max_iterations), 10) if deep
+                                else int(self.cfg.max_iterations)),
+                target_score=99.0 if deep else float(self.cfg.target_score),
+                analytic=ref_stats is not None,
+                weights=self.cfg.critic_weights or None,
+                polish=deep,
+            )
+            if deep:
+                log(f"DEEP MATCH: target 99 · up to {cfg.max_iterations} iterations · "
+                    "coordinate-descent polish to the scene's ceiling afterwards")
             result = run_match(start, ref_stats, semantics, hooks, cfg, locks,
                                rig_notes="; ".join(rig.get("notes", [])),
                                director_note=director_note)
@@ -518,7 +553,7 @@ class Controller:
                     log(line)
         e.locks = locks
         self.session.record_match(camera_name, result.best_state, result.best_score)
-        self.save_session()
+        self._save_or_warn(log)
         score_txt = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
         log(f"match finished: {result.stop_reason}, best score {score_txt} "
             f"({len(result.iterations)} iterations)")
@@ -541,6 +576,10 @@ class Controller:
         e = self.session.entry(camera_name)
         if not e.reference:
             raise RuntimeError("bind a reference image to this camera first")
+        if len(note) > MAX_NOTE_CHARS:
+            log(f"note truncated to {MAX_NOTE_CHARS} chars ({len(note)} given) — notes "
+                "are persisted and pinned into every prompt of the run")
+            note = note[:MAX_NOTE_CHARS]
         e.notes = (getattr(e, "notes", []) + [note])[-6:]
         combined = " · ".join(e.notes[-3:])
         rig = self.rig(refresh=True)
@@ -554,6 +593,15 @@ class Controller:
         ref_block = self._image_block(e.reference)
         if ref_block is None:
             raise RuntimeError("reference image could not be prepared for the LLM")
+
+        # snapshot-first: capture the artist's true light BEFORE the note's nudges and
+        # lens probes touch the scene, and tell run_match (via _plan_snapped) not to
+        # re-snapshot a MaxGaffer-mutated state over it — Restore must return the
+        # artist's light, never our own intermediate
+        if e.pre_match is None:
+            e.pre_match = ap.read_state(rig, self._baselines, cam)
+        self._plan_snapped = camera_name
+        self._save_or_warn(log)
 
         base = (e.state.copy() if e.state is not None
                 else ap.read_state(rig, self._baselines, cam))
@@ -685,27 +733,35 @@ class Controller:
             log("⚠ reference stats unavailable — board renders without scores")
         run_dir = self._new_run_dir(camera_name)
         results: List[Dict] = []
-        for cand in board:
-            if should_cancel():
-                log("scenario board cancelled")
-                break
-            self._apply_logged(rig, cand["state"], cam, log)
-            path = rd.render_frame(
-                cam, os.path.join(run_dir, f"scen_{cand['key']}.png"),
-                self.cfg.loop_width, self.cfg.loop_height)
-            score = None
-            if path:
-                log(f"THUMB::{path}")
-                if ref is not None:
-                    cur = self.stats_for(path)
-                    if cur is not None:
-                        score = critic.score(ref, cur,
-                                             self.cfg.critic_weights or None).score
-            log(f"scenario {cand['label']}: "
-                + (f"{score:.1f}" if score is not None else "unscored")
-                + f" — {cand['why']}")
-            results.append({**cand, "render": path, "score": score})
-        self._apply_logged(rig, current, cam, log)   # leave the scene as it was found
+        try:
+            for cand in board:
+                if should_cancel():
+                    log("scenario board cancelled")
+                    break
+                self._apply_logged(rig, cand["state"], cam, log)
+                path = rd.render_frame(
+                    cam, os.path.join(run_dir, f"scen_{cand['key']}.png"),
+                    self.cfg.loop_width, self.cfg.loop_height)
+                score = None
+                if path:
+                    log(f"THUMB::{path}")
+                    if ref is not None:
+                        cur = self.stats_for(path)
+                        if cur is not None:
+                            score = critic.score(ref, cur,
+                                                 self.cfg.critic_weights or None).score
+                log(f"scenario {cand['label']}: "
+                    + (f"{score:.1f}" if score is not None else "unscored")
+                    + f" — {cand['why']}")
+                results.append({**cand, "render": path, "score": score})
+        finally:
+            # SPEC law: leave the scene exactly as it was found — even when an apply or
+            # a render raises mid-board (the dock's "✗ board" must not hide a light swap)
+            try:
+                self._apply_logged(rig, current, cam, log)
+            except Exception as err:  # noqa: BLE001 the restore must not mask the cause
+                log(f"⚠ could not restore the found light after the board ({err}) — "
+                    "use Restore to get it back")
         return results
 
     def adopt_scenario(self, camera_name: str, state: LightingState,
@@ -742,19 +798,25 @@ class Controller:
             e.pre_seed = {"file": sc.get_dome_texture(dome),
                           "rotation": sc.read_dome_rotation(dome)}
         # fingerprint the inputs into the FILENAME: Max caches bitmaps by path, so a
-        # re-seed (new reference, moved sun) into the same file can render stale
+        # re-seed into the same filename renders the STALE pano (seed_filename's own
+        # invariant). The pano is oriented around cam_yaw and carries a semantics-derived
+        # sun disc when sun_az/sun_alt are None — so yaw AND the semantics signature are
+        # fingerprint inputs, not just the reference and the sun numbers
         import hashlib
 
+        yaw = sc.camera_yaw_deg(cam) if cam is not None else 0.0
         try:
             ref_sig = f"{e.reference}:{os.path.getmtime(e.reference):.0f}"
         except OSError:
             ref_sig = e.reference
+        sem_sig = hashlib.md5(json.dumps(semantics, sort_keys=True, default=str)
+                              .encode("utf-8", "replace")).hexdigest()[:8]
         token = hashlib.md5(
-            f"{ref_sig}|{sun_az}|{sun_alt}".encode("utf-8", "replace")).hexdigest()[:8]
+            f"{ref_sig}|{sun_az}|{sun_alt}|{yaw:.3f}|{sem_sig}"
+            .encode("utf-8", "replace")).hexdigest()[:8]
         out = os.path.join(self._ensure_run_dir(_safe(camera_name)),
                            domeseed.seed_filename(camera_name, token))
         prev_seed = e.seed_hdri
-        yaw = sc.camera_yaw_deg(cam) if cam is not None else 0.0
         src = e.reference
         if _needs_max_ingest(src):             # EXR/HDR/TIFF ref: Max transcodes first
             src = self._transcode_ref(e.reference) or src
@@ -773,7 +835,8 @@ class Controller:
         if how == "failed":
             raise RuntimeError("dome texture could not be set (no writable file property "
                                "— checklist #16)")
-        rot_how = sc.write_dome_rotation(dome, 0.0)
+        with self._dome_undo():
+            rot_how = sc.write_dome_rotation(dome, 0.0)
         e.seed_hdri = out
         # a matched state's dome.rotation_deg was tuned against the REPLACED texture —
         # re-applying it on camera switch would spin the world-oriented seed off-axis
@@ -828,7 +891,8 @@ class Controller:
         dome = self.rig().get("dome")
         if dome is None:
             return "failed"
-        how = sc.set_dome_texture(dome, hdri_path)
+        with self._dome_undo():
+            how = sc.set_dome_texture(dome, hdri_path)
         try:
             import pymxs
 
@@ -853,28 +917,57 @@ class Controller:
         for w in ap.apply_state(rig, self._baselines, state, cam):
             log("⚠ " + w)
 
+    @staticmethod
+    def _dome_undo():
+        """Dome texture/rotation writes get their own undo record, mirroring
+        apply_state's 'one undo record per apply' (apply.py) — seed binds, manual HDRI
+        picks and Restore's pre-seed branch must all be Ctrl+Z-able."""
+        import pymxs
+
+        return pymxs.undo(True, "MaxGaffer dome")
+
     # ------------------------------------------------------------------ restore
-    def restore_pre_match(self, camera_name: str) -> bool:
+    def restore_pre_match(self, camera_name: str,
+                          log: Callable[[str], None] = lambda _m: None) -> bool:
+        """Restore what MaxGaffer changed: the pre-match light (when one was snapped),
+        the pre-seed dome texture/rotation (when a seed replaced them — reachable even
+        with NO pre_match, so a seed-only session is restorable too), and the exposure
+        control WE auto-created. Returns False when there is nothing to restore."""
         e = self.session.cameras.get(camera_name)
-        if not (e and e.pre_match is not None):
+        if e is None or (e.pre_match is None and not e.pre_seed):
             return False
-        self.apply_state(e.pre_match, camera_name)
+        if e.pre_match is not None:
+            self.apply_state(e.pre_match, camera_name)
+        if getattr(e, "ec_created", False):
+            # WE auto-created the scene's exposure control for the match — Restore must
+            # exit the experiment entirely, not leave our EC in the artist's scene
+            try:
+                import pymxs
+
+                with pymxs.undo(True, "MaxGaffer exposure control"):
+                    pymxs.runtime.SceneExposureControl.exposureControl = \
+                        pymxs.runtime.undefined
+                log("removed the auto-created V-Ray exposure control")
+            except Exception as err:  # noqa: BLE001 cleanup must not fail the restore
+                log(f"⚠ could not remove the auto-created exposure control ({err})")
+            e.ec_created = False
         if e.pre_seed:                         # a seed replaced the dome texture — undo it
             dome = self.rig().get("dome")
             if dome is not None:
                 prev = str(e.pre_seed.get("file") or "")
-                if prev:
-                    sc.set_dome_texture(dome, prev)
-                else:                          # dome had no HDRI: disable texture use
-                    sc.set_prop(dome, sc.DOME_TEX_ON, False)
-                try:
-                    sc.write_dome_rotation(dome,
-                                           float(e.pre_seed.get("rotation") or 0.0))
-                except (TypeError, ValueError):
-                    pass
+                with self._dome_undo():
+                    if prev:
+                        sc.set_dome_texture(dome, prev)
+                    else:                      # dome had no HDRI: disable texture use
+                        sc.set_prop(dome, sc.DOME_TEX_ON, False)
+                    try:
+                        sc.write_dome_rotation(dome,
+                                               float(e.pre_seed.get("rotation") or 0.0))
+                    except (TypeError, ValueError):
+                        pass
             e.pre_seed = {}
             e.seed_hdri = ""
-            self.save_session()
+        self.save_session()
         return True
 
     # ------------------------------------------------------------------ vantage
@@ -890,27 +983,45 @@ class Controller:
     ) -> List[Dict]:
         """MAIN-THREAD half: per camera, apply its saved lighting state and export the
         .vrscene. Raises on export failure (nothing has rendered yet — cheap to abort).
-        Note: the scene is left holding the LAST camera's lighting state.
+        The scene's found light (and dome texture) is restored in a finally — a
+        snapshot-first tool never strands the LAST camera's light in the artist's scene.
 
         vrscene exports are the heavyweight artifacts (100s of MB on real interiors), so
         old export batches are pruned by the same keep_runs policy as loop renders."""
         vantage_parent = self._ensure_run_dir("vantage")
         export_dir = os.path.join(vantage_parent, _stamp())
         jobs: List[Dict] = []
-        for name in camera_names:
-            on_progress(name, "applying + exporting")
-            if use_saved_states:
-                e = self.session.cameras.get(name)
-                if e and e.state is not None:
-                    self.apply_state(e.state, name)
-                self._rebind_seed(name)        # each vrscene must carry ITS camera's sky
-            scene_file = vt.export_vrscene(
-                os.path.join(export_dir, f"{_safe(name)}.vrscene"), name)
-            if scene_file is None:
-                raise RuntimeError(f"{name}: vrscene export failed "
-                                   "(vrayExportVRScene missing or camera not set)")
-            jobs.append({"camera": name, "scene_file": scene_file,
-                         "output": os.path.join(out_dir, f"{_safe(name)}.png")})
+        rig = self.rig()
+        dome = rig.get("dome")
+        found = found_tex = None
+        if use_saved_states:
+            found = ap.read_state(rig, self._baselines, None)
+            found_tex = sc.get_dome_texture(dome) if dome is not None else None
+        try:
+            for name in camera_names:
+                on_progress(name, "applying + exporting")
+                if use_saved_states:
+                    e = self.session.cameras.get(name)
+                    if e and e.state is not None:
+                        self.apply_state(e.state, name)
+                    self._rebind_seed(name)    # each vrscene must carry ITS camera's sky
+                scene_file = vt.export_vrscene(
+                    os.path.join(export_dir, f"{_safe(name)}.vrscene"), name)
+                if scene_file is None:
+                    raise RuntimeError(f"{name}: vrscene export failed "
+                                       "(vrayExportVRScene missing or camera not set)")
+                jobs.append({"camera": name, "scene_file": scene_file,
+                             "output": os.path.join(out_dir, f"{_safe(name)}.png")})
+        finally:
+            if found is not None:
+                try:
+                    self._apply_logged(rig, found, None, lambda _m: None)
+                    if dome is not None and found_tex \
+                            and sc.get_dome_texture(dome) != found_tex:
+                        with self._dome_undo():
+                            sc.set_dome_texture(dome, found_tex)
+                except Exception:  # noqa: BLE001 the export result stands regardless
+                    on_progress("", "⚠ scene light could not be restored after export")
         prune_old_runs(vantage_parent, keep=int(self.cfg.keep_runs))
         return jobs
 
@@ -928,25 +1039,41 @@ class Controller:
     ) -> Dict[str, str]:
         """DEFAULT final-render backend (stock Vantage 3.x has no headless CLI): per
         camera, apply its saved state and production-render through V-Ray at final res.
-        MAIN THREAD — renders block Max by nature; progress narrates between shots."""
+        MAIN THREAD — renders block Max by nature; progress narrates between shots.
+        The scene's found light (and dome texture) is restored in a finally — finals
+        must not strand the LAST camera's light in the artist's scene."""
         results: Dict[str, str] = {}
         os.makedirs(out_dir, exist_ok=True)
-        for name in camera_names:
-            on_progress(name, "applying state")
-            e = self.session.cameras.get(name)
-            if e and e.state is not None:
-                self.apply_state(e.state, name)
-            self._rebind_seed(name)            # finals render under their own seed too
-            cam = sc.get_camera(name)
-            if cam is None:
-                results[name] = "camera not found"
+        rig = self.rig()
+        dome = rig.get("dome")
+        found = ap.read_state(rig, self._baselines, None)
+        found_tex = sc.get_dome_texture(dome) if dome is not None else None
+        try:
+            for name in camera_names:
+                on_progress(name, "applying state")
+                e = self.session.cameras.get(name)
+                if e and e.state is not None:
+                    self.apply_state(e.state, name)
+                self._rebind_seed(name)        # finals render under their own seed too
+                cam = sc.get_camera(name)
+                if cam is None:
+                    results[name] = "camera not found"
+                    on_progress(name, results[name])
+                    continue
+                on_progress(name, f"rendering {self.cfg.final_width}×{self.cfg.final_height} (V-Ray)")
+                out = rd.render_frame(cam, os.path.join(out_dir, f"{_safe(name)}.png"),
+                                      self.cfg.final_width, self.cfg.final_height)
+                results[name] = "ok" if out else "render failed"
                 on_progress(name, results[name])
-                continue
-            on_progress(name, f"rendering {self.cfg.final_width}×{self.cfg.final_height} (V-Ray)")
-            out = rd.render_frame(cam, os.path.join(out_dir, f"{_safe(name)}.png"),
-                                  self.cfg.final_width, self.cfg.final_height)
-            results[name] = "ok" if out else "render failed"
-            on_progress(name, results[name])
+        finally:
+            try:
+                self._apply_logged(rig, found, None, lambda _m: None)
+                if dome is not None and found_tex \
+                        and sc.get_dome_texture(dome) != found_tex:
+                    with self._dome_undo():
+                        sc.set_dome_texture(dome, found_tex)
+            except Exception:  # noqa: BLE001 the renders stand regardless
+                on_progress("", "⚠ scene light could not be restored after finals")
         return results
 
     def export_and_open_vantage(
@@ -967,8 +1094,17 @@ class Controller:
     # ------------------------------------------------------------------ dirs
     def _ensure_run_dir(self, sub: str) -> str:
         stem = _safe(os.path.splitext(os.path.basename(sc.scene_path() or "unsaved"))[0])
-        d = os.path.join(cfgmod.sessions_dir(), stem, sub)
-        os.makedirs(d, exist_ok=True)
+        try:
+            d = os.path.join(cfgmod.sessions_dir(), stem, sub)
+            os.makedirs(d, exist_ok=True)
+        except OSError as err:
+            # disk full / unwritable %LOCALAPPDATA% — fall back to the temp dir and say
+            # WHY (a bare "✗ unexpected" from the dock's catch-all tells nothing)
+            import tempfile
+
+            d = os.path.join(tempfile.gettempdir(), "MaxGaffer_sessions", stem, sub)
+            os.makedirs(d, exist_ok=True)
+            print(f"MaxGaffer: sessions dir unavailable ({err}) — run files go to {d}")
         return d
 
     def _new_run_dir(self, camera_name: str) -> str:
@@ -1011,8 +1147,43 @@ def prune_old_runs(parent_dir: str, keep: int) -> int:
     return removed
 
 
+def prune_old_files(parent_dir: str, keep: int) -> int:
+    """Delete the oldest FILES beyond ``keep`` (mtime order) — the refs/ transcode cache
+    grows unbounded otherwise. keep <= 0 disables pruning. Mirrors prune_old_runs."""
+    if keep <= 0:
+        return 0
+    try:
+        files = [os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
+                 if os.path.isfile(os.path.join(parent_dir, f))]
+        files.sort(key=lambda p: os.path.getmtime(p))
+    except OSError:
+        return 0
+    removed = 0
+    for p in files[:-keep]:
+        try:
+            os.remove(p)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+# Win32 reserved device names: a camera/scene named "CON", "NUL", "COM1"… makes
+# makedirs fail with a confusing OSError, and trailing dots/spaces are stripped by the
+# filesystem (path then collides or misbehaves) — both are normalized away here
+_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)})
+
+
 def _safe(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name) or "unnamed"
+    s = "".join(c if c.isalnum() or c in "-_." else "_" for c in name).rstrip(". ")
+    if not s:
+        return "unnamed"
+    if s.split(".", 1)[0].lower() in _RESERVED_NAMES:
+        s = "_" + s
+    return s
 
 
 def _stamp() -> str:

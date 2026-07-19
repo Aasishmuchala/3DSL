@@ -44,7 +44,11 @@ def main(argv=None) -> int:
 
     out = []
     for p in paths:
-        entry = {"path": p, "stats": metrics.compute_stats(p)}
+        try:
+            stats = metrics.compute_stats(p)
+        except Exception:                     # one corrupt image must not kill the batch
+            stats = None                      # (contract: null for unreadable)
+        entry = {"path": p, "stats": stats}
         if want_b64:
             try:
                 entry["b64"] = _b64_jpeg(p)

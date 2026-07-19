@@ -5,3 +5,10 @@ __pycache__/
 *.egg-info/
 config.json
 dist/
+
+# box-local artifacts (quarantined startup scripts, harness run output)
+scripts/_quarantine/
+scripts/kimi_*
+!scripts/kimi_onbox_test.py
+!scripts/kimi_onbox_runner.ms
+!scripts/kimi_gui_runner.ms

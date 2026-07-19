@@ -35,6 +35,7 @@ _RULES: Tuple[Tuple[str, str, float], ...] = (
     (r"\b(practicals? (too )?(dim|weak)|more practicals?)", "group.*", +0.5),
 )
 _INTENSIFIERS = re.compile(r"\b(way|much|far|very|really) too\b")
+_NEGATORS = re.compile(r"\b(?:not|no)\b|['’]nt\b|n['’]t\b")   # "not"/"no"/are-n't/do-n't
 _LOG_KEYS = ("sun.size",)          # these deltas are applied in log2 space
 _GROUP_WILDCARD = "group.*"
 
@@ -54,6 +55,8 @@ def nudges_from_note(note: str, current_keys: List[str],
             for sep in (",", ";", ".", " and ", " but "):
                 if sep in lead:
                     lead = lead.rsplit(sep, 1)[1]
+            if _NEGATORS.search(lead):
+                continue    # "not too bright" / "aren't too soft" is the OPPOSITE intent
             scale = 2.0 if _INTENSIFIERS.search(lead + m.group(0)) else 1.0
             if key == _GROUP_WILDCARD:
                 for g in group_names:
@@ -74,7 +77,11 @@ def apply_note_deltas(state, deltas: Dict[str, float]):
         if key in _LOG_KEYS:
             changes[key] = cur * (2.0 ** delta)
         elif key.startswith("group."):
-            changes[key] = max(0.0, cur * (2.0 ** delta))
+            # log-space math can never leave 0 multiplicatively — a group the first guess
+            # zeroed (daylight ref kills practicals) would no-op silently; bootstrap a
+            # floor so the nudge actually moves
+            base = cur if cur > 1e-3 else 0.25
+            changes[key] = max(0.0, base * (2.0 ** delta))
         else:
             changes[key] = cur + delta
     new, accepted, _rej = apply_changes(state, changes, limit=False)

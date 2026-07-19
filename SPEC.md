@@ -3,7 +3,7 @@
 **Owner:** Aasish Muchala · **Type:** internal Sthyra pipeline tool (not sold) ·
 **Target:** 3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x ·
 **Sibling of:** MaxDirector (same Omega gateway, same hexagon, key borrowed automatically) ·
-**Status:** v0.8.0 CONVERSATION 2026-07-16 · refine ensemble + premium UI · · 114 tests · live benchmark: Phase C 99.14 ASSERTED (deterministic legs from basin) · Phase B full live pipeline 98.25, az error 4° · stack doc-verified ·
+**Status:** v0.9.4 ROUND-4 AUDIT · adversarial swarm fixes (113 findings resolved) · 3154 tests · live benchmark: Phase C 99.14 ASSERTED (deterministic legs from basin) · Phase B full live pipeline 98.25, az error 4° · stack doc-verified ·
 awaiting on-box bring-up (tasks/plan.md P0).
 
 ## 1. Summary
@@ -51,7 +51,12 @@ maxgaffer/core/       PURE python, zero pymxs/Qt (guard test) — runs + tests o
   director.py           the loop: keep-best, slump-revert, stall, leash, contamination guard
   session.py            per-camera entries + adopt-once baselines + pre-match snapshots
   prompts.py / parse.py ANALYZE · DELTAS · SWEEP, schema-in-prompt + strict shape validation
+  consensus.py          3-sample ANALYZE self-consistency (majority/median/circular-mean)
   omega.py / colortemp.py  gateway client (ported verbatim) · kelvin↔RGB
+  scenedigest.py / planner.py  digest text the LLM plans against · PLAN-stage validation
+  feedback.py           director's notes: craft-table nudges + notes pinned into prompts
+  domeseed.py / hdr_min.py  reference-derived equirect pano synthesis · stdlib RGBE writer
+  scenarios.py          scenario board: candidate rigs, probe-rendered, critic-scored
 maxgaffer/maxbridge/  the ONLY pymxs importer
   scene.py              cameras+yaw, rig classify (sun/dome/layer-groups), sun angles, dome rot
   exposure.py           host abstraction (EC → physical cam → none)
@@ -60,12 +65,13 @@ maxgaffer/maxbridge/  the ONLY pymxs importer
   vantage.py            live-link probe (globals→actionMan scan→manual msg), export, CLI batch
   controller.py         session/rig/stats/LLM glue + run_match wiring + vantage two-phase
   config.py             %LOCALAPPDATA%/MaxGaffer/config.json (+ MaxDirector key borrow)
+  digest.py / execute.py  full scene introspection · plan exec, one undo, before/after capture
   draft.py              opt-in draft sampler: crash-safe snapshot → apply → restore/recover
 maxgaffer/api.py      public API (MaxDirector LightMatch stage): match_camera / batch / vantage
 maxgaffer/ui/dock.py  PySide6 dock: camera board · reference · match/batch · rig · vantage
 maxgaffer/sidecar/    optional Pillow stats/b64 CLI for a system python
 scripts/              install.bat · preflight.py
-tests/                77 pytest, pure core, incl. round-2 stress + v0.3 regressions
+tests/                3154 pytest, pure core, incl. round-4 audit + round-2 stress + v0.3 regressions
 ```
 
 ## 4. The match pipeline (with guard placement)

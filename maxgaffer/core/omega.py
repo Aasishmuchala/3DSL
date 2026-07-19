@@ -5,7 +5,9 @@ contract is hard-won and verified live against the real gateway:
   - NO tools / tool_choice (the gateway 500s on them) — the JSON schema is embedded in the
     system prompt and the reply is parsed out of the TEXT blocks;
   - non-streaming; Bearer key; anthropic-version header;
-  - retries with backoff on 429/5xx; ~120s wall-clock ceiling per attempt;
+  - retries with jittered backoff on 429/5xx; the 120s timeout is per socket I/O op
+    (urllib semantics), NOT a total wall-clock bound — a slow-drip server can hold
+    one attempt far longer;
   - multimodal via base64 image blocks (reference + render comparisons are the whole point).
 
 The only module in core allowed to touch the network; ``post`` is injectable so the entire
@@ -15,6 +17,7 @@ suite runs offline.
 from __future__ import annotations
 
 import json
+import random
 import time
 from typing import Optional
 
@@ -32,9 +35,12 @@ class OmegaError(RuntimeError):
 
 
 def extract_text(payload: dict) -> str:
+    if not isinstance(payload, dict):       # a 200 proxy/error page can parse as a list
+        return ""
     blocks = payload.get("content") or []
     return "\n".join(
-        b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"
+        str(b.get("text") or "")            # text:null / non-string text coerces, never raises
+        for b in blocks if isinstance(b, dict) and b.get("type") == "text"
     ).strip()
 
 
@@ -145,7 +151,8 @@ def call(
                     text_body[:2000],
                 )
         if attempt < len(BACKOFF_S):
-            time.sleep(BACKOFF_S[attempt])
+            base = BACKOFF_S[attempt]
+            time.sleep(base + random.uniform(0.0, base * 0.5))  # jitter vs retry herds
     raise OmegaError(last, "network")
 
 
@@ -157,8 +164,12 @@ def image_block(b64: str, media_type: str = "image/png") -> dict:
     return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
 
 
-def image_block_from_file(path: str) -> Optional[dict]:
-    """Base64 image block straight from disk (media type from the extension)."""
+def image_block_from_file(path: str, max_bytes: int = 3_500_000) -> Optional[dict]:
+    """Base64 image block straight from disk (media type from the extension).
+
+    Files over ``max_bytes`` are refused (None): the gateway caps images near 5 MB and
+    base64 inflates ~x4/3, so 3.5 MB mirrors the controller's own guard for callers
+    that don't pre-check size."""
     import base64
     import os
 
@@ -168,6 +179,8 @@ def image_block_from_file(path: str) -> Optional[dict]:
     if media is None:
         return None
     try:
+        if os.path.getsize(path) > max_bytes:
+            return None
         with open(path, "rb") as f:
             return image_block(base64.b64encode(f.read()).decode("ascii"), media)
     except OSError:

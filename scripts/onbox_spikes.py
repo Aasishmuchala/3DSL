@@ -50,6 +50,20 @@ def matched(obj, tuples):
     return out
 
 
+def _ev_probe_delta(base_ev):
+    """Genome-clamp-aware direction for the EV-direction spike: +2 EV unless that would
+    clamp at the genome max, else -2 EV (None = pinned against BOTH bounds, spike n/a).
+    A clamped probe renders frames identical to base and would FALSE-FAIL a healthy box."""
+    from maxgaffer.core.genome import SPEC_BY_KEY
+
+    spec = SPEC_BY_KEY["exposure.ev"]
+    if base_ev + 2.0 <= spec.hi:
+        return 2.0
+    if base_ev - 2.0 >= spec.lo:
+        return -2.0
+    return None
+
+
 def main():
     from maxgaffer.core import metrics
     from maxgaffer.maxbridge import config as cfgmod
@@ -166,14 +180,20 @@ def main():
             if "exposure.ev" not in st.values:
                 raise RuntimeError("no EV host")
             base_ev = st.get("exposure.ev")
+            delta = _ev_probe_delta(base_ev)
+            if delta is None:
+                return (f"EV host pinned against the genome bounds (EV {base_ev:.1f}) — "
+                        "direction spike n/a, skipped (not a failure)")
             apply_state(rig, baselines, st, cam)
             k1 = probe("ev_base")["log_key"]
-            st.set("exposure.ev", base_ev + 2.0)
+            st.set("exposure.ev", base_ev + delta)
             apply_state(rig, baselines, st, cam)
-            k2 = probe("ev_plus2")["log_key"]
-            if k2 >= k1:
-                raise RuntimeError(f"INVERTED: key rose {k1:.4f}→{k2:.4f} after +2 EV")
-            return f"+2 EV darkened key {k1:.4f} → {k2:.4f} ✓"
+            k2 = probe("ev_probe")["log_key"]
+            darkened = k2 < k1
+            if darkened != (delta > 0):
+                raise RuntimeError(f"INVERTED: key moved {k1:.4f}→{k2:.4f} after "
+                                   f"{delta:+.0f} EV (higher EV must darken)")
+            return f"{delta:+.0f} EV moved key {k1:.4f} → {k2:.4f} the right way ✓"
 
         check("H", "EV direction (measured)", ev_direction)
 
@@ -280,7 +300,13 @@ def main():
         check("R", "scenario board candidates (v0.9)", board_core)
 
     finally:
-        apply_state(rig, baselines, snapshot, cam)   # always leave the scene as found
+        try:
+            apply_state(rig, baselines, snapshot, cam)   # always leave the scene as found
+        except Exception as e:  # noqa: BLE001 — a failed restore must not eat the report
+            print(f"  [!!!!] scene restore FAILED ({type(e).__name__}: {e}) — "
+                  "MANUAL RESTORE NEEDED (undo may still recover the pre-spike state)")
+            RESULTS.append(("REST", "scene restored after spikes", "FAIL",
+                            f"{type(e).__name__}: {e} — MANUAL RESTORE NEEDED"))
 
     # ---------- L vrscene export (#7)
     check("L/#7", "vrscene export", lambda: (

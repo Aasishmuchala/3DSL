@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from . import critic, solver
-from .genome import LightingState, apply_changes, state_table
+from .genome import LightingState, apply_changes, spec_for, state_table
 from .parse import ParseError
 
 
@@ -73,6 +73,17 @@ def _anneal(best_score: Optional[float]) -> float:
     if best_score < 85.0:
         return 0.5
     return 0.25
+
+
+def _bound_pinned(key: str, wanted: float) -> bool:
+    """True when a solver target arrives sitting exactly ON the genome bound.
+
+    solve_ev/solve_wb pre-clamp to the genome, so the leash-window delta below is blind
+    to it: when the window is wider than the genome, "the solver wants more than the rig
+    can express" never registers as a leash hit — yet it is the SAME albedo-mismatch
+    signal the leash exists to report (SPEC §2 analytic leash)."""
+    spec = spec_for(key)
+    return spec is not None and (wanted <= spec.lo or wanted >= spec.hi)
 
 
 # adaptive coordinate line-search table: (key, initial_step, is_log2_step, fine_floor).
@@ -151,6 +162,7 @@ def run_match(
     best_state = state.copy()
     best_score: Optional[float] = None
     best_render: Optional[str] = None
+    live: Optional[LightingState] = None   # what the scene is actually wearing right now
     records: List[IterationRecord] = []
     score_history: List[Tuple[int, float]] = []
     slump_count = 0
@@ -162,181 +174,207 @@ def run_match(
     leash_wb_hi = start_state.get("exposure.wb_kelvin", 6500.0) + cfg.wb_leash
     leash_hits = 0
 
-    for i in range(cfg.max_iterations):
-        if hooks.should_cancel():
-            stop_reason = "cancelled"
-            break
-        rec = IterationRecord(index=i, state=state.to_dict())
-        hooks.apply(state)
-        path = hooks.render(f"iter{i:02d}")
-        rec.render_path = path
-        if path is None:
-            hooks.log(f"iter {i}: render failed — stopping")
-            stop_reason = "render_failed"
-            records.append(rec)
-            break
+    # keep-best is a GUARANTEE, not the happy path: a hook dying mid-iteration (apply,
+    # render, stats, gateway) must never strand the scene on an exploratory state —
+    # land the best known state with the audit trail complete, then surface the error.
+    try:
+        for i in range(cfg.max_iterations):
+            if hooks.should_cancel():
+                stop_reason = "cancelled"
+                break
+            rec = IterationRecord(index=i, state=state.to_dict())
+            hooks.apply(state)
+            live = state
+            path = hooks.render(f"iter{i:02d}")
+            rec.render_path = path
+            if path is None:
+                hooks.log(f"iter {i}: render failed — stopping")
+                stop_reason = "render_failed"
+                records.append(rec)
+                break
 
-        cur_stats = hooks.stats(path) if metrics_ok else None
-        # MEASURED mis-exposure of the frame the LLM is about to judge — drives the
-        # contamination guard directly (the capped/annealed applied delta understates it)
-        misexposure = 0.0
-        if cur_stats is not None and ref_stats is not None:
-            import math as _math
+            cur_stats = hooks.stats(path) if metrics_ok else None
+            # MEASURED mis-exposure of the frame the LLM is about to judge — drives the
+            # contamination guard directly (the capped/annealed applied delta understates it)
+            misexposure = 0.0
+            if cur_stats is not None and ref_stats is not None:
+                import math as _math
 
-            misexposure = abs(_math.log2(
-                max(1e-5, float(ref_stats.get("log_key", 0.0)))
-                / max(1e-5, float(cur_stats.get("log_key", 0.0)))))
-        if cur_stats is not None and ref_stats is not None:
-            verdict = critic.score(ref_stats, cur_stats, cfg.weights)
-            rec.score, rec.components = verdict.score, verdict.components
-            score_history.append((i, verdict.score))
-            hooks.log(f"iter {i}: score {verdict.summary()}")
+                misexposure = abs(_math.log2(
+                    max(1e-5, float(ref_stats.get("log_key", 0.0)))
+                    / max(1e-5, float(cur_stats.get("log_key", 0.0)))))
+            if cur_stats is not None and ref_stats is not None:
+                verdict = critic.score(ref_stats, cur_stats, cfg.weights)
+                rec.score, rec.components = verdict.score, verdict.components
+                score_history.append((i, verdict.score))
+                hooks.log(f"iter {i}: score {verdict.summary()}")
 
-            improved = best_score is None or verdict.score > best_score + 1e-9
-            if improved:
-                if best_score is not None and verdict.score < best_score + cfg.stall_delta:
-                    stall_count += 1
-                else:
-                    stall_count = 0
-                best_score, best_state, best_render = verdict.score, state.copy(), path
-                slump_count = 0
-            else:
-                stall_count += 1
-                if verdict.score < (best_score or 0) - cfg.slump_tolerance:
-                    slump_count += 1
-                    if slump_count >= 2:
-                        hooks.log(f"iter {i}: slumping — reverting to best "
-                                  f"({best_score:.1f})")
-                        state = best_state.copy()
-                        rec.reverted_to_best = True
-                        slump_count = 0
-                else:
+                improved = best_score is None or verdict.score > best_score + 1e-9
+                if improved:
+                    if best_score is not None and verdict.score < best_score + cfg.stall_delta:
+                        stall_count += 1
+                    else:
+                        stall_count = 0
+                    best_score, best_state, best_render = verdict.score, state.copy(), path
                     slump_count = 0
+                else:
+                    stall_count += 1
+                    if verdict.score < (best_score or 0) - cfg.slump_tolerance:
+                        slump_count += 1
+                        if slump_count >= 2:
+                            hooks.log(f"iter {i}: slumping — reverting to best "
+                                      f"({best_score:.1f})")
+                            state = best_state.copy()
+                            rec.reverted_to_best = True
+                            slump_count = 0
+                    else:
+                        slump_count = 0
 
-            if verdict.score >= cfg.target_score:
-                stop_reason = "target_reached"
+                if verdict.score >= cfg.target_score:
+                    stop_reason = "target_reached"
+                    records.append(rec)
+                    break
+                if stall_count >= cfg.stall_patience and i >= 1:
+                    stop_reason = "stalled"
+                    records.append(rec)
+                    break
+            else:
+                if best_render is None:
+                    best_state, best_render = state.copy(), path
+
+            if rec.reverted_to_best:
+                # the stats in hand describe the state we just ABANDONED — solving or asking
+                # the LLM from them would tweak the restored state on stale evidence. Re-render
+                # first; next iteration reasons from coherent measurements.
+                hooks.log(f"iter {i}: reverted — re-measuring before further changes")
+                records.append(rec)
+                continue
+
+            if i == cfg.max_iterations - 1:  # last render measured; no point proposing more
                 records.append(rec)
                 break
-            if stall_count >= cfg.stall_patience and i >= 1:
-                stop_reason = "stalled"
+
+            # ---- analytic solve (deterministic, before/independent of the LLM)
+            # annealed: exploration-sized steps and deadbands shrink as the score climbs
+            anneal = _anneal(best_score)
+            analytic: Dict[str, float] = {}
+            if cfg.analytic and cur_stats is not None and ref_stats is not None:
+                analytic = solver.analytic_pass(state, ref_stats, cur_stats, locks,
+                                                tighten=anneal)
+                if "exposure.ev" in analytic:
+                    wanted = analytic["exposure.ev"]
+                    leashed = min(leash_ev_hi, max(leash_ev_lo, wanted))
+                    if abs(leashed - wanted) > 1e-6:
+                        leash_hits += 1
+                        hooks.log(f"iter {i}: EV solve hit its leash "
+                                  f"({leashed:+.1f} vs wanted {wanted:+.1f})")
+                    elif _bound_pinned("exposure.ev", wanted):
+                        leash_hits += 1
+                        hooks.log(f"iter {i}: EV solve pinned at the genome bound "
+                                  f"({wanted:+.1f}) — wants more than the rig can express")
+                    analytic["exposure.ev"] = leashed
+                if "exposure.wb_kelvin" in analytic:
+                    wanted = analytic["exposure.wb_kelvin"]
+                    leashed = min(leash_wb_hi, max(leash_wb_lo, wanted))
+                    if abs(leashed - wanted) > 1e-6:
+                        leash_hits += 1
+                        hooks.log(f"iter {i}: WB solve hit its leash ({leashed:.0f}K)")
+                    elif _bound_pinned("exposure.wb_kelvin", wanted):
+                        leash_hits += 1
+                        hooks.log(f"iter {i}: WB solve pinned at the genome bound "
+                                  f"({wanted:.0f}K) — wants more than the rig can express")
+                    analytic["exposure.wb_kelvin"] = leashed
+                if analytic:
+                    state, accepted, _ = apply_changes(state, analytic, locks, limit=False)
+                    rec.analytic_changes = accepted
+                    hooks.log("iter %d: analytic %s" % (
+                        i, ", ".join(f"{k}={v:.2f}" for k, v in accepted.items())))
+
+            # ---- LLM deltas
+            if hooks.should_cancel():
+                stop_reason = "cancelled"
                 records.append(rec)
                 break
-        else:
-            if best_render is None:
-                best_state, best_render = state.copy(), path
+            # per-param trajectory — the model sees its own oscillation (live sim showed
+            # altitude ping-ponging 6→-1→6 when each iteration judged in isolation)
+            param_history: Dict[str, List[float]] = {}
+            for r in records:
+                for k, v in list(r.analytic_changes.items()) + list(r.llm_accepted.items()):
+                    param_history.setdefault(k, []).append(round(v, 2))
+            history_txt = "\n".join(
+                f"  {k}: {' → '.join(str(x) for x in vs[-5:])}"
+                for k, vs in sorted(param_history.items()) if len(vs) >= 2)
+            ctx = {
+                "iteration": i,
+                "max_iterations": cfg.max_iterations,
+                "state_table": state_table(state, locks),
+                "semantics": semantics,
+                "score_history": score_history,
+                "analytic_applied": rec.analytic_changes,
+                "param_history": history_txt,
+                "render_path": path,
+                "rig_notes": rig_notes,
+                "director_note": director_note,
+                "max_changes": cfg.max_changes,
+            }
+            try:
+                from .parse import validate_deltas
 
-        if rec.reverted_to_best:
-            # the stats in hand describe the state we just ABANDONED — solving or asking
-            # the LLM from them would tweak the restored state on stale evidence. Re-render
-            # first; next iteration reasons from coherent measurements.
-            hooks.log(f"iter {i}: reverted — re-measuring before further changes")
+                proposal = validate_deltas(hooks.llm_deltas(ctx), cfg.max_changes)
+            except ParseError as e:
+                hooks.log(f"iter {i}: LLM reply unusable ({e}) — keeping analytic-only step")
+                proposal = {"assessment": "", "changes": {}, "reasons": {}, "stop": False}
+            rec.assessment = proposal["assessment"]
+            if proposal["assessment"]:
+                hooks.log(f"iter {i}: gaffer: {proposal['assessment']}")
+            # structural, not just prompted: while the analytic solver is running, ANALYTIC
+            # params are the solver's alone — live fire showed the model overriding a perfect
+            # EV solve and costing two iterations of re-correction (sim_match, 2026-07-16)
+            if cfg.analytic and metrics_ok:
+                from .genome import spec_for
+
+                for k in [k for k in proposal["changes"]
+                          if (spec_for(k) is not None and spec_for(k).analytic)]:
+                    proposal["changes"].pop(k, None)
+                    rec.llm_rejected.append(f"{k}: analytic — the solver owns it")
+                    hooks.log(f"iter {i}: refused {k} (analytic — solver owns it)")
+            # contaminated-iteration guard: the frame the LLM critiqued was MEASURABLY
+            # mis-exposed — its absolute-brightness judgments (intensities, groups) are
+            # contamination regardless of how much of the error the solver corrected
+            if misexposure >= cfg.contaminated_ev_step:
+                dropped = [k for k in proposal["changes"]
+                           if k.endswith(".intensity") or k.startswith("group.")]
+                for k in dropped:
+                    proposal["changes"].pop(k, None)
+                    rec.llm_rejected.append(
+                        f"{k}: dropped — render was {misexposure:.1f} stops mis-exposed, "
+                        "brightness judgment contaminated")
+                if dropped:
+                    hooks.log(f"iter {i}: dropped {len(dropped)} intensity change(s) — "
+                              "the model judged a mis-exposed frame")
+            state, accepted, rejected = apply_changes(state, proposal["changes"], locks,
+                                                      limit=True, step_scale=anneal)
+            rec.llm_accepted = accepted
+            rec.llm_rejected.extend(rejected)   # extend — the contamination guard logged here too
+            for r in rejected:
+                hooks.log(f"iter {i}: rejected {r}")
+            for k, v in accepted.items():
+                hooks.log(f"iter {i}: Δ {k} → {v:.2f}  ({proposal['reasons'].get(k, '')})")
             records.append(rec)
-            continue
-
-        if i == cfg.max_iterations - 1:  # last render measured; no point proposing more
-            records.append(rec)
-            break
-
-        # ---- analytic solve (deterministic, before/independent of the LLM)
-        # annealed: exploration-sized steps and deadbands shrink as the score climbs
-        anneal = _anneal(best_score)
-        analytic: Dict[str, float] = {}
-        if cfg.analytic and cur_stats is not None and ref_stats is not None:
-            analytic = solver.analytic_pass(state, ref_stats, cur_stats, locks,
-                                            tighten=anneal)
-            if "exposure.ev" in analytic:
-                leashed = min(leash_ev_hi, max(leash_ev_lo, analytic["exposure.ev"]))
-                if abs(leashed - analytic["exposure.ev"]) > 1e-6:
-                    leash_hits += 1
-                    hooks.log(f"iter {i}: EV solve hit its leash "
-                              f"({leashed:+.1f} vs wanted {analytic['exposure.ev']:+.1f})")
-                analytic["exposure.ev"] = leashed
-            if "exposure.wb_kelvin" in analytic:
-                leashed = min(leash_wb_hi, max(leash_wb_lo, analytic["exposure.wb_kelvin"]))
-                if abs(leashed - analytic["exposure.wb_kelvin"]) > 1e-6:
-                    leash_hits += 1
-                    hooks.log(f"iter {i}: WB solve hit its leash ({leashed:.0f}K)")
-                analytic["exposure.wb_kelvin"] = leashed
-            if analytic:
-                state, accepted, _ = apply_changes(state, analytic, locks, limit=False)
-                rec.analytic_changes = accepted
-                hooks.log("iter %d: analytic %s" % (
-                    i, ", ".join(f"{k}={v:.2f}" for k, v in accepted.items())))
-
-        # ---- LLM deltas
-        if hooks.should_cancel():
-            stop_reason = "cancelled"
-            records.append(rec)
-            break
-        # per-param trajectory — the model sees its own oscillation (live sim showed
-        # altitude ping-ponging 6→-1→6 when each iteration judged in isolation)
-        param_history: Dict[str, List[float]] = {}
-        for r in records:
-            for k, v in list(r.analytic_changes.items()) + list(r.llm_accepted.items()):
-                param_history.setdefault(k, []).append(round(v, 2))
-        history_txt = "\n".join(
-            f"  {k}: {' → '.join(str(x) for x in vs[-5:])}"
-            for k, vs in sorted(param_history.items()) if len(vs) >= 2)
-        ctx = {
-            "iteration": i,
-            "max_iterations": cfg.max_iterations,
-            "state_table": state_table(state, locks),
-            "semantics": semantics,
-            "score_history": score_history,
-            "analytic_applied": rec.analytic_changes,
-            "param_history": history_txt,
-            "render_path": path,
-            "rig_notes": rig_notes,
-            "director_note": director_note,
-            "max_changes": cfg.max_changes,
-        }
+            if proposal["stop"] and not accepted and not rec.analytic_changes:
+                stop_reason = "llm_satisfied"
+                break
+    except Exception:
         try:
-            from .parse import validate_deltas
-
-            proposal = validate_deltas(hooks.llm_deltas(ctx), cfg.max_changes)
-        except ParseError as e:
-            hooks.log(f"iter {i}: LLM reply unusable ({e}) — keeping analytic-only step")
-            proposal = {"assessment": "", "changes": {}, "reasons": {}, "stop": False}
-        rec.assessment = proposal["assessment"]
-        if proposal["assessment"]:
-            hooks.log(f"iter {i}: gaffer: {proposal['assessment']}")
-        # structural, not just prompted: while the analytic solver is running, ANALYTIC
-        # params are the solver's alone — live fire showed the model overriding a perfect
-        # EV solve and costing two iterations of re-correction (sim_match, 2026-07-16)
-        if cfg.analytic and metrics_ok:
-            from .genome import spec_for
-
-            for k in [k for k in proposal["changes"]
-                      if (spec_for(k) is not None and spec_for(k).analytic)]:
-                proposal["changes"].pop(k, None)
-                rec.llm_rejected.append(f"{k}: analytic — the solver owns it")
-                hooks.log(f"iter {i}: refused {k} (analytic — solver owns it)")
-        # contaminated-iteration guard: the frame the LLM critiqued was MEASURABLY
-        # mis-exposed — its absolute-brightness judgments (intensities, groups) are
-        # contamination regardless of how much of the error the solver corrected
-        if misexposure >= cfg.contaminated_ev_step:
-            dropped = [k for k in proposal["changes"]
-                       if k.endswith(".intensity") or k.startswith("group.")]
-            for k in dropped:
-                proposal["changes"].pop(k, None)
-                rec.llm_rejected.append(
-                    f"{k}: dropped — render was {misexposure:.1f} stops mis-exposed, "
-                    "brightness judgment contaminated")
-            if dropped:
-                hooks.log(f"iter {i}: dropped {len(dropped)} intensity change(s) — "
-                          "the model judged a mis-exposed frame")
-        state, accepted, rejected = apply_changes(state, proposal["changes"], locks,
-                                                  limit=True, step_scale=anneal)
-        rec.llm_accepted = accepted
-        rec.llm_rejected.extend(rejected)   # extend — the contamination guard logged here too
-        for r in rejected:
-            hooks.log(f"iter {i}: rejected {r}")
-        for k, v in accepted.items():
-            hooks.log(f"iter {i}: Δ {k} → {v:.2f}  ({proposal['reasons'].get(k, '')})")
-        records.append(rec)
-        if proposal["stop"] and not accepted and not rec.analytic_changes:
-            stop_reason = "llm_satisfied"
-            break
+            hooks.apply(best_state)
+        except Exception as restore_err:
+            hooks.log(f"⚠ match aborted AND re-applying the best state failed "
+                      f"({restore_err}) — use Restore to recover the pre-match rig")
+        else:
+            note = f" (best {best_score:.1f})" if best_score is not None else ""
+            hooks.log(f"⚠ match aborted by an error — best-known state re-applied{note}; "
+                      "the audit trail above is intact")
+        raise
 
     if leash_hits >= 2:
         hooks.log("⚠ the exposure/WB solver kept hitting its leash — the reference and "
@@ -344,10 +382,11 @@ def run_match(
                   "Consider locking exposure.ev / exposure.wb_kelvin and setting them by eye.")
 
     # ---- always land on the best known state
-    if best_score is not None:
-        hooks.apply(best_state)
-    else:
+    if best_score is None:
         best_state = state
+    # ...but only touch the scene when it is NOT already wearing that state — a no-op
+    # re-apply is a phantom Ctrl+Z step (one undo record per apply, SPEC trust model)
+    if live is None or live.to_dict() != best_state.to_dict():
         hooks.apply(best_state)
     result = MatchResult(
         best_state=best_state,
@@ -358,15 +397,28 @@ def run_match(
     )
 
     # ---- DEEP-MATCH finisher: squeeze to the scene's ceiling, then prove it
+    # (never after a render failure — polish would burn renders against a dead renderer)
     if (cfg.polish and best_score is not None and ref_stats is not None
-            and best_score < cfg.polish_stop_at and stop_reason != "cancelled"):
-        p_state, p_score, probes, converged = run_polish(
-            best_state, best_score, ref_stats, hooks, cfg, locks)
+            and best_score < cfg.polish_stop_at
+            and stop_reason not in ("cancelled", "render_failed")):
+        try:
+            p_state, p_score, probes, converged = run_polish(
+                best_state, best_score, ref_stats, hooks, cfg, locks)
+        except Exception:
+            # polish probes are exploratory too — a dead hook mid-climb must leave the
+            # loop's best state live, not the last probe
+            try:
+                hooks.apply(best_state)
+            except Exception:
+                pass
+            hooks.log("⚠ polish aborted by an error — loop-best state re-applied")
+            raise
         result.polish_gain = round(p_score - best_score, 2)
         result.polish_probes = probes
         result.ceiling_converged = converged
         result.best_state, result.best_score = p_state, p_score
-        hooks.apply(p_state)
+        # NO trailing apply here — every run_polish return path already landed `best`;
+        # re-applying the identical state is a no-op undo step (SPEC: one undo per apply)
         if converged and p_score < cfg.polish_stop_at:
             hooks.log(f"ceiling: no fine move improves {p_score:.1f} — that score IS this "
                       "scene's optimum for this reference (content gap, not lighting)")
@@ -429,11 +481,16 @@ def run_polish(
             for direction in (1.0, -1.0):
                 climbing = True
                 stride = step        # accelerating line search: consecutive keeps
-                while climbing and probes < cfg.polish_max_probes \
+                while climbing and not hooks.should_cancel() \
+                        and probes < cfg.polish_max_probes \
                         and best_score < cfg.polish_stop_at:
                     cand = best.copy()
                     v = cand.get(key)
-                    cand.set(key, v * (2.0 ** (direction * stride)) if is_log
+                    # a log-scale probe MULTIPLIES: v == 0 stays 0 forever (a dome the
+                    # LLM drove to 0 could never be turned back up). Seed the probe from
+                    # the fine floor so a zeroed log axis is explorable again.
+                    base = floor if is_log and v <= 0.0 else v
+                    cand.set(key, base * (2.0 ** (direction * stride)) if is_log
                              else v + direction * stride)
                     if abs(cand.get(key) - v) < 1e-6:
                         break            # clamped to a bound — nowhere to go
@@ -489,57 +546,75 @@ def run_sun_sweep(
     dir_scores: List[Optional[float]] = []
     probe_grids: List[List[float]] = []
     ref_grid = (ref_stats or {}).get("grid")
-    for az in azimuths:
-        if hooks.should_cancel():
-            return None, "na", "cancelled"
-        probe = state.copy()
-        probe.set("sun.azimuth_deg", az)
-        hooks.apply(probe)
-        path = hooks.render(f"sweep{az:03.0f}")
-        if path:
-            paths.append(path)
-            kept.append(az)
-            score = None
-            if ref_grid and any(abs(v) > 1e-6 for v in ref_grid):
-                st = hooks.stats(path)
-                if st and st.get("grid"):
-                    score = (cosine(ref_grid, st["grid"]) + 1.0) / 2.0
-                    probe_grids.append(list(st["grid"]))
-            dir_scores.append(score)
-        else:
-            hooks.log(f"sweep: render failed at azimuth {az:.0f}° — skipping")
-    if len(paths) < 2:
-        return None, "na", "not enough sweep renders"
+    # probes move the sun BEFORE their render — a FAILED sweep (too few renders, an
+    # unusable reply, a dead hook) must hand back the scene it was given, not the
+    # last probed azimuth (the loop's iter0 apply only masked this on the happy path)
+    entry = state.copy()
+    touched = False                 # no probe applied yet → nothing to restore
+    completed = False
     try:
-        picked = validate_sweep(llm_pick(paths, kept), len(paths))
-    except ParseError as e:
-        return None, "na", f"sweep reply unusable: {e}"
-    idx = picked["best_index"]
-    # cross-check only when EVERY probe was measurable — a partial score table could
-    # crown a probe merely because its rivals went unmeasured (predictability > cleverness)
-    if all(s is not None for s in dir_scores) and len(probe_grids) == len(kept):
-        # CONTRASTIVE grids: all probes share the scene's dominant pattern (sky gradient),
-        # which swamps the sun's contribution — live fire showed a SUNLESS probe scoring
-        # 0.97 raw similarity. Subtract the probes' mean grid so only what varies WITH sun
-        # direction is compared; skip the override entirely if that residue is negligible.
-        from .metrics import cosine as _cos
+        for az in azimuths:
+            if hooks.should_cancel():
+                return None, "na", "cancelled"
+            probe = state.copy()
+            probe.set("sun.azimuth_deg", az)
+            hooks.apply(probe)
+            touched = True
+            path = hooks.render(f"sweep{az:03.0f}")
+            if path:
+                paths.append(path)
+                kept.append(az)
+                score = None
+                if ref_grid and any(abs(v) > 1e-6 for v in ref_grid):
+                    st = hooks.stats(path)
+                    if st and st.get("grid"):
+                        score = (cosine(ref_grid, st["grid"]) + 1.0) / 2.0
+                        probe_grids.append(list(st["grid"]))
+                dir_scores.append(score)
+            else:
+                hooks.log(f"sweep: render failed at azimuth {az:.0f}° — skipping")
+        if len(paths) < 2:
+            return None, "na", "not enough sweep renders"
+        try:
+            picked = validate_sweep(llm_pick(paths, kept), len(paths))
+        except ParseError as e:
+            return None, "na", f"sweep reply unusable: {e}"
+        idx = picked["best_index"]
+        # cross-check only when EVERY probe was measurable — a partial score table could
+        # crown a probe merely because its rivals went unmeasured (predictability > cleverness)
+        if all(s is not None for s in dir_scores) and len(probe_grids) == len(kept):
+            # CONTRASTIVE grids: all probes share the scene's dominant pattern (sky gradient),
+            # which swamps the sun's contribution — live fire showed a SUNLESS probe scoring
+            # 0.97 raw similarity. Subtract the probes' mean grid so only what varies WITH sun
+            # direction is compared; skip the override entirely if that residue is negligible.
+            from .metrics import cosine as _cos
 
-        mean_grid = [sum(g[i] for g in probe_grids) / len(probe_grids) for i in range(9)]
-        ref_d = [ref_grid[i] - mean_grid[i] for i in range(9)]
-        contrast = []
-        for g in probe_grids:
-            d = [g[i] - mean_grid[i] for i in range(9)]
-            contrast.append((_cos(ref_d, d) + 1.0) / 2.0)
-        energy = sum(abs(v) for v in ref_d)
-        if energy > 0.01:
-            metric_idx = max(range(len(contrast)), key=lambda i: contrast[i])
-            if metric_idx != idx and contrast[metric_idx] - contrast[idx] > 0.15:
-                hooks.log(f"sweep: direction metric overrides — {kept[metric_idx]:.0f}° "
-                          f"(contrast {contrast[metric_idx]:.2f}) beats the pick of "
-                          f"{kept[idx]:.0f}° ({contrast[idx]:.2f})")
-                idx = metric_idx
-        else:
-            hooks.log("sweep: direction residue too small to cross-check — LLM pick stands")
-    az = kept[idx]
-    hooks.log(f"sweep: azimuth {az:.0f}° — {picked['why']}")
-    return az, picked["altitude_hint"], picked["why"]
+            mean_grid = [sum(g[i] for g in probe_grids) / len(probe_grids) for i in range(9)]
+            ref_d = [ref_grid[i] - mean_grid[i] for i in range(9)]
+            contrast = []
+            for g in probe_grids:
+                d = [g[i] - mean_grid[i] for i in range(9)]
+                contrast.append((_cos(ref_d, d) + 1.0) / 2.0)
+            energy = sum(abs(v) for v in ref_d)
+            if energy > 0.01:
+                metric_idx = max(range(len(contrast)), key=lambda i: contrast[i])
+                if metric_idx != idx and contrast[metric_idx] - contrast[idx] > 0.15:
+                    hooks.log(f"sweep: direction metric overrides — {kept[metric_idx]:.0f}° "
+                              f"(contrast {contrast[metric_idx]:.2f}) beats the pick of "
+                              f"{kept[idx]:.0f}° ({contrast[idx]:.2f})")
+                    idx = metric_idx
+            else:
+                hooks.log("sweep: direction residue too small to cross-check — LLM pick stands")
+        az = kept[idx]
+        hooks.log(f"sweep: azimuth {az:.0f}° — {picked['why']}")
+        completed = True
+        return az, picked["altitude_hint"], picked["why"]
+    finally:
+        if not completed and touched:
+            try:
+                hooks.apply(entry)
+            except Exception:
+                pass            # the real failure is already surfacing — never mask it
+            else:
+                hooks.log("sweep: failed — sun azimuth restored to "
+                          f"{entry.get('sun.azimuth_deg'):.0f}°")

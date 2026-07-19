@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import scene as sc
@@ -30,6 +31,23 @@ LIVE_LINK_GLOBALS = (
     "vray_startVantageLiveLink()",
 )
 
+# Candidate state queries — older V-Ray exposes none of these, in which case the link
+# state is undetectable and we must report a TOGGLE honestly instead of "started".
+LIVE_LINK_PROBES = (
+    "vantageLiveLinkActive()",
+    "vrayVantageLiveLinkActive()",
+    "isVantageLiveLinkActive()",
+)
+
+#: Per-job wall-clock limit for one vantage_console still. 20 minutes is generous for a
+#: single frame; the old 60-minute budget left a hung console (dead license server, modal
+#: on a hidden desktop) un-killable for a full hour per camera.
+DEFAULT_JOB_TIMEOUT_S = 20 * 60
+
+#: Files stamped within this slack of the spawn time still count as this run's output
+#: (filesystem mtime granularity / clock skew).
+_MTIME_SLACK_S = 2.0
+
 
 def _rt():
     import pymxs
@@ -37,29 +55,57 @@ def _rt():
     return pymxs.runtime
 
 
+def _probe_live_link(rt):
+    """Best-effort live-link state read. → True/False when a probe answered, None when
+    the state is not detectable (stock V-Ray exposes no documented query)."""
+    for expr in LIVE_LINK_PROBES:
+        try:
+            val = rt.execute(expr)
+        except Exception:
+            continue
+        if isinstance(val, bool):
+            return val
+    return None
+
+
 def start_live_link() -> Tuple[bool, str]:
-    """Execute V-Ray's 'Initiate a Live-Link to Chaos Vantage' action (a TOGGLE — it also
-    stops an active link). → (executed?, how/diagnostic). Degrades off-Max."""
+    """Execute V-Ray's 'Initiate a Live-Link to Chaos Vantage' action. That action is a
+    TOGGLE (it also stops an active link), so we probe the link state first and never
+    claim "started" without a state read. → (executed?, how/diagnostic). Degrades off-Max."""
     try:
         rt = _rt()
     except Exception:
         return False, "pymxs unavailable (not running inside 3ds Max)"
+    state = _probe_live_link(rt)
+    if state is True:
+        return True, "live link already active — left untouched"
+    fire = None
     for expr in LIVE_LINK_GLOBALS:
         try:
             rt.execute(expr)
-            return True, f"maxscript global {expr}"
+            fire = f"maxscript global {expr}"
+            break
         except Exception:
             continue
-    hit = _find_live_link_action()
-    if hit is not None:
-        action, label = hit
-        try:
-            action.execute()
-            return True, f"actionMan: {label}"
-        except Exception as e:  # noqa: BLE001
-            return False, f"found action '{label}' but execute failed: {e}"
-    return False, ("no live-link entry point found — start it once via the V-Ray menu "
-                   "(Chaos Vantage live link); the link then mirrors everything MaxGaffer does")
+    if fire is None:
+        hit = _find_live_link_action()
+        if hit is not None:
+            action, label = hit
+            try:
+                action.execute()
+                fire = f"actionMan: {label}"
+            except Exception as e:  # noqa: BLE001
+                return False, f"found action '{label}' but execute failed: {e}"
+    if fire is None:
+        return False, ("no live-link entry point found — start it once via the V-Ray menu "
+                       "(Chaos Vantage live link); the link then mirrors everything MaxGaffer does")
+    after = _probe_live_link(rt)
+    if state is False or after is True:
+        return True, f"started via {fire}"
+    if after is False:
+        return True, f"toggled via {fire} — a link was already active and is now OFF"
+    return True, (f"toggled via {fire} (link state not detectable — the V-Ray action is "
+                  "a toggle: if a link was already running, it is now off)")
 
 
 def _find_live_link_action():
@@ -91,37 +137,67 @@ def _find_live_link_action():
 
 
 def export_vrscene(path: str, camera_name: Optional[str] = None) -> Optional[str]:
-    """Export the current scene (single frame, active camera) as .vrscene."""
+    """Export the current scene (single frame, active camera) as .vrscene. The viewport's
+    previously active camera is restored afterwards — a batch export must not leave the
+    user's viewport parked on the last exported camera."""
     rt = _rt()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    if camera_name and not sc.set_active_camera(camera_name):
-        return None
-    if not hasattr(rt, "vrayExportVRScene"):
-        return None
+    prev_cam = None
     try:
-        frame = int(rt.currentTime.frame) if hasattr(rt.currentTime, "frame") else 0
+        prev_cam = rt.viewport.getCamera()
     except Exception:
-        frame = 0
-    try:  # rich signature first (compressed keeps multi-GB interiors manageable)
-        rt.vrayExportVRScene(path, exportCompressed=True, startFrame=frame, endFrame=frame)
-    except Exception:
-        try:
-            rt.vrayExportVRScene(path)
-        except Exception:
+        prev_cam = None
+    try:
+        if camera_name and not sc.set_active_camera(camera_name):
             return None
-    return path if os.path.exists(path) else None
+        if not hasattr(rt, "vrayExportVRScene"):
+            return None
+        try:
+            frame = int(rt.currentTime.frame) if hasattr(rt.currentTime, "frame") else 0
+        except Exception:
+            frame = 0
+        try:  # rich signature first (compressed keeps multi-GB interiors manageable)
+            rt.vrayExportVRScene(path, exportCompressed=True, startFrame=frame, endFrame=frame)
+        except Exception:
+            try:
+                rt.vrayExportVRScene(path)
+            except Exception:
+                return None
+        return path if os.path.exists(path) else None
+    finally:
+        if prev_cam is not None:
+            try:
+                rt.viewport.setCamera(prev_cam)
+            except Exception:
+                pass
 
 
-def _output_written(output: str) -> bool:
+def _output_written(output: str, min_mtime: Optional[float] = None) -> bool:
     """Vantage may write frame-suffixed files (out.0000.png) instead of the exact name —
-    accept any non-empty file sharing the stem in the same folder."""
-    if os.path.exists(output) and os.path.getsize(output) > 0:
+    accept the exact file or a ``stem.<digits><ext>`` sibling (a bare startswith would
+    also match "Shot10.png" for stem "Shot1"). With ``min_mtime``, only files modified at
+    or after that timestamp count, so a stale file from a previous batch can never pass."""
+    def fresh(p: str) -> bool:
+        try:
+            return (os.path.getsize(p) > 0
+                    and (min_mtime is None or os.path.getmtime(p) >= min_mtime))
+        except OSError:
+            return False
+
+    if os.path.exists(output) and fresh(output):
         return True
     folder = os.path.dirname(output) or "."
-    stem = os.path.splitext(os.path.basename(output))[0]
+    base = os.path.basename(output)
+    stem, ext = os.path.splitext(base)
     try:
-        return any(f.startswith(stem) and os.path.getsize(os.path.join(folder, f)) > 0
-                   for f in os.listdir(folder))
+        for f in os.listdir(folder):
+            if f == base or not f.startswith(stem + "."):
+                continue
+            num, tail = os.path.splitext(f[len(stem):])   # ".0000.png" → ".0000", ".png"
+            if num[1:].isdigit() and tail.lower() == ext.lower() \
+                    and fresh(os.path.join(folder, f)):
+                return True
+        return False
     except OSError:
         return False
 
@@ -150,37 +226,90 @@ def launch_vantage(vantage_exe: str, scene_file: Optional[str] = None) -> bool:
         return False
 
 
+def _run_console(cmd: List[str], timeout_s: float,
+                 should_cancel: Optional[Callable[[], bool]]) -> Tuple[str, Optional[int]]:
+    """Run one vantage_console job, polling so a cancel or timeout actually kills the
+    child (output is unused and goes to DEVNULL — unread pipes could deadlock a chatty
+    console). → (status, returncode): status ∈ "done" | "timeout" | "cancelled"."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + float(timeout_s)
+    status = "done"
+    while proc.poll() is None:
+        if should_cancel is not None and should_cancel():
+            status = "cancelled"
+            break
+        if time.monotonic() > deadline:
+            status = "timeout"
+            break
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5.0)
+        except Exception:
+            pass
+    return status, proc.returncode
+
+
 def render_stills(
     jobs: List[Dict],                      # {camera, scene_file, output}
     console_exe: str,
     width: int,
     height: int,
     on_progress: Optional[Callable[[str, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    timeout_s: float = DEFAULT_JOB_TIMEOUT_S,
 ) -> Dict[str, str]:
     """LEGACY/Developer-Edition ONLY: sequential vantage_console CLI batch. Stock Vantage
-    2.0+ removed these flags — use the V-Ray backend or the in-app batch queue instead."""
+    2.0+ removed these flags — use the V-Ray backend or the in-app batch queue instead.
+
+    Every job gets a result entry — a failed camera never abandons the rest of the batch.
+    ``should_cancel`` (a pollable callable, e.g. ``threading.Event.is_set``) is checked
+    between jobs and while a console runs, and kills the running child. Each job is
+    capped at ``timeout_s`` seconds (default DEFAULT_JOB_TIMEOUT_S = 20 min — a hung
+    console is killed, not waited on for an hour). A pre-existing exact output is deleted
+    before launch and the post-run check requires a fresh mtime, so a stale render from
+    a previous batch is never accepted as this run's."""
     results: Dict[str, str] = {}
     if not os.path.exists(console_exe):
         return {j["camera"]: f"vantage_console not found: {console_exe}" for j in jobs}
     for job in jobs:
         cam = job["camera"]
-        if on_progress:
-            on_progress(cam, "rendering (vantage)")
-        cmd = vantage_command(console_exe, job["scene_file"], job["output"], width, height)
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60)
-            if proc.returncode == 0 and _output_written(job["output"]):
-                results[cam] = "ok"
-                if on_progress:
-                    on_progress(cam, "done")
-            else:
-                results[cam] = f"vantage exit {proc.returncode}"
-                if on_progress:
-                    on_progress(cam, results[cam])
-                break
-        except Exception as e:  # noqa: BLE001
-            results[cam] = f"error: {e}"
+        if should_cancel is not None and should_cancel():
+            results[cam] = "cancelled"
             if on_progress:
                 on_progress(cam, results[cam])
-            break
+            continue
+        if on_progress:
+            on_progress(cam, "rendering (vantage)")
+        out = job["output"]
+        try:                                # never accept a stale file as this run's
+            if os.path.exists(out):
+                os.remove(out)
+        except OSError:
+            pass
+        spawned = time.time()
+        cmd = vantage_command(console_exe, job["scene_file"], out, width, height)
+        try:
+            status, rc = _run_console(cmd, timeout_s, should_cancel)
+            if status == "cancelled":
+                results[cam] = "cancelled"
+            elif status == "timeout":
+                results[cam] = f"timeout after {int(timeout_s)}s"
+            elif rc == 0 and _output_written(out, min_mtime=spawned - _MTIME_SLACK_S):
+                results[cam] = "ok"
+            elif rc == 0:
+                results[cam] = "vantage exit 0 but no output written"
+            else:
+                results[cam] = f"vantage exit {rc}"
+        except Exception as e:  # noqa: BLE001
+            results[cam] = f"error: {e}"
+        if on_progress:
+            on_progress(cam, "done" if results[cam] == "ok" else results[cam])
     return results

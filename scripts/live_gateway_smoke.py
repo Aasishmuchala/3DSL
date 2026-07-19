@@ -96,7 +96,7 @@ def main() -> int:
     if not key:
         print("[!!] no oc_ key found (argv/env/configs/hermes) — cannot smoke the gateway")
         return 2
-    print(f"key: {key[:6]}…{key[-4:]} · model: {omega.DEFAULT_MODEL} · {omega.GATEWAY_URL}")
+    print(f"key: oc_…(redacted) · model: {omega.DEFAULT_MODEL} · {omega.GATEWAY_URL}")
     results = {}
 
     # ---- 0 ping
